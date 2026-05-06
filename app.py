@@ -37,7 +37,7 @@ MAX_QUERY_LEN = 500
 
 EXAMPLE_QUERIES = [
     ("🎬  Fold a fitted sheet", "how to fold a fitted sheet"),
-    ("🔧  Change a car tire", "how to change a car tire"),
+    ("🔧  Clean undercarriage of a car", "how to clean the undercarriage of a car"),
     ("💬  What causes inflation", "what causes inflation"),
     ("📡  How does GPS work", "how does GPS know where you are"),
 ]
@@ -647,6 +647,7 @@ def main() -> None:
         "automatically detect when a query needs a video answer — and embed the "
         "right clip at the right moment."
     )
+    st.caption("*Aashil Soni · Forum Sanjanwala*")
     st.divider()
 
     render_search_ui()
@@ -660,13 +661,86 @@ def main() -> None:
         elif len(query) > MAX_QUERY_LEN:
             st.error(f"Query too long ({len(query)} chars). Max is {MAX_QUERY_LEN}.")
         else:
-            with st.spinner("Running agents…"):
-                result = run_pipeline(query)
-            st.session_state.last_result = result
+            trace: dict = {"query": query, "errors": {}, "timings_ms": {}}
+            t_start = time.perf_counter()
+
+            with st.status("Running Gemini VideoSense agents…", expanded=True) as status:
+
+                # Step 1 — parallel: text answer + intent classifier
+                st.write("🔍 Running Intent Classifier and generating text answer in parallel…")
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    text_future = pool.submit(agents.generate_text_answer, query)
+                    intent_future = pool.submit(agents.classify_visual_intent, query)
+                    try:
+                        text_answer = text_future.result()
+                    except Exception as e:
+                        text_answer = ""
+                        trace["errors"]["text_answer"] = repr(e)
+                    try:
+                        intent = intent_future.result()
+                        trace["visual_intent"] = intent.model_dump()
+                    except Exception as e:
+                        intent = None
+                        trace["errors"]["visual_intent"] = repr(e)
+
+                trace["text_answer"] = text_answer
+                if intent:
+                    fmt_map = {"short": "short-form video", "long": "long-form video", "none": "text only"}
+                    st.write(f"✅ Intent: **{fmt_map.get(intent.format, intent.format)}** · {intent.confidence:.0%} confident — _{intent.rationale}_")
+                else:
+                    st.write("❌ Intent Classifier failed — check agent pipeline for details")
+
+                # Step 2 — YouTube search
+                youtube_result = None
+                timestamp_pick = None
+                if intent and intent.has_visual_intent and intent.format in ("short", "long"):
+                    kind = "YouTube Short" if intent.format == "short" else "video"
+                    st.write(f"🎬 Searching YouTube for the best {kind}…")
+                    try:
+                        youtube_result = agents.find_youtube_video(query, intent.format)
+                        trace["youtube"] = youtube_result.model_dump() if youtube_result else None
+                        if youtube_result:
+                            st.write(f"✅ Found **{youtube_result.title}** by {youtube_result.channel} ({fmt_count(youtube_result.views)} views)")
+                        else:
+                            st.write("⚠️ No relevant video found for this query")
+                    except Exception as e:
+                        trace["errors"]["youtube"] = repr(e)
+                        st.write("❌ YouTube Search failed — check agent pipeline for details")
+
+                    # Step 3 — timestamp picker
+                    if youtube_result and youtube_result.duration_secs > 60:
+                        st.write(f"⏱️ Reading the video to find the right moment…")
+                        try:
+                            timestamp_pick = agents.find_timestamp(query, youtube_result.video_url)
+                            trace["timestamp"] = timestamp_pick.model_dump()
+                            if 0 <= timestamp_pick.start_seconds < timestamp_pick.end_seconds:
+                                st.write(f"✅ Best clip: **{fmt_ts(timestamp_pick.start_seconds)}** → **{fmt_ts(timestamp_pick.end_seconds)}** — _{timestamp_pick.reasoning}_")
+                            else:
+                                trace["errors"]["timestamp"] = "invalid range — rendering without jump"
+                                timestamp_pick = None
+                                st.write("⚠️ Timestamp out of range — will play from start")
+                        except Exception as e:
+                            trace["errors"]["timestamp"] = repr(e)
+                            timestamp_pick = None
+                            st.write("⚠️ Timestamp Picker failed — will play from start")
+                else:
+                    if intent:
+                        st.write("💬 Text-only response — no video needed for this query")
+
+                trace["timings_ms"]["total"] = round((time.perf_counter() - t_start) * 1000)
+                trace["youtube_result"] = youtube_result
+                trace["timestamp_pick"] = timestamp_pick
+                trace["intent"] = intent
+                status.update(
+                    label=f"✓ Done in {trace['timings_ms']['total']} ms",
+                    state="complete",
+                    expanded=False,
+                )
+
+            st.session_state.last_result = trace
 
             # Update history (newest first, cap at 5)
-            intent = result.get("intent")
-            had_video = result.get("youtube_result") is not None
+            had_video = youtube_result is not None
             intent_label = (
                 f"{intent.format} · {intent.confidence:.0%}" if intent else "error"
             )
@@ -688,7 +762,9 @@ def main() -> None:
 
         st.divider()
         render_agent_pipeline(result)
-        render_how_it_works()
+
+    st.divider()
+    render_how_it_works()
 
 
 if __name__ == "__main__":
