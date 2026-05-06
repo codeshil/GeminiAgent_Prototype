@@ -462,8 +462,129 @@ def render_agent_pipeline(result: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# How it works accordion
 # ---------------------------------------------------------------------------
+
+
+def render_how_it_works() -> None:
+    with st.expander("📖  How this prototype works", expanded=False):
+
+        st.markdown("### Overview")
+        st.markdown(
+            "This prototype simulates a proposed Gemini feature called **Visual Intent Detection**. "
+            "Today, Gemini only embeds a YouTube video when you literally type the word *'video'* in your query. "
+            "This feature adds three AI agents that collaborate to detect *when a video would be the better answer* — "
+            "even when you never asked for one."
+        )
+
+        st.divider()
+
+        st.markdown("### API connections")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Google Gemini API**")
+            st.markdown(
+                "- Model: `gemini-2.5-flash` \n"
+                "- Used by: Intent Classifier, Timestamp Picker, text answer generator, and search query optimizer \n"
+                "- Accessed via the `google-genai` Python SDK \n"
+                "- Returns structured JSON using Gemini's native JSON mode with a typed schema"
+            )
+        with col2:
+            st.markdown("**YouTube Data API v3**")
+            st.markdown(
+                "- Used by: YouTube Search agent \n"
+                "- Calls the `search.list` endpoint to find relevant videos \n"
+                "- Calls `videos.list` to fetch view counts, like counts, and exact duration \n"
+                "- Free tier: 10,000 units/day (~100 searches)"
+            )
+
+        st.divider()
+
+        st.markdown("### The three agents")
+
+        st.markdown("#### 1 · Intent Classifier")
+        st.markdown(
+            "The first agent reads the user's query and decides whether video is the right medium. "
+            "It uses a **few-shot prompt** — a set of 8 labeled examples built into the prompt — "
+            "to teach Gemini the pattern before it sees the live query. "
+            "It returns four fields:"
+        )
+        st.markdown(
+            "| Field | What it means |\n"
+            "|---|---|\n"
+            "| `has_visual_intent` | True/False — should a video be shown at all? |\n"
+            "| `format` | `short` (demo ≤ ~90 s), `long` (explainer, multi-step), or `none` (text only) |\n"
+            "| `confidence` | 0–1 float. How certain the model is. Shown as a % in the pipeline card. |\n"
+            "| `rationale` | One sentence explaining the decision. |\n"
+        )
+        st.markdown(
+            "**What confidence % means:** a score of `0.95` means the model is 95% certain this query needs a video. "
+            "Scores below ~0.70 indicate the query is ambiguous — the model is making a judgment call. "
+            "This score does not come from a probability distribution over labels; "
+            "it is Gemini's self-reported certainty from the structured output."
+        )
+
+        st.markdown("#### 2 · YouTube Search Agent")
+        st.markdown(
+            "Only fires when `has_visual_intent = True`. Before hitting YouTube, "
+            "a quick Gemini call **rewrites the raw user query** into an optimized YouTube search string "
+            "(e.g. *'how to fold a fitted sheet?'* → *'fold fitted sheet shorts'*). "
+            "This avoids returning irrelevant viral videos that happen to match loose keywords."
+        )
+        st.markdown(
+            "**Short vs. long video selection:**\n"
+            "- `format = short` → searches `videoDuration=short` (under 4 min) and appends *'shorts'* to the query to surface YouTube Shorts. "
+            "Genuine Shorts (≤ 90 s) get a **3× engagement score boost** so they beat similar-quality longer videos — "
+            "but a tutorial with 10× more views still wins over a low-engagement Short.\n"
+            "- `format = long` → searches `videoDuration=medium` and `long`, ranks by views + recency.\n\n"
+            "Ranking always competes only within the **top 5 relevance results** returned by YouTube, "
+            "so a viral but unrelated video ranked #8 can never beat the most relevant result."
+        )
+
+        st.markdown("#### 3 · Timestamp Picker")
+        st.markdown(
+            "Fires whenever the selected video is **longer than 60 seconds** — regardless of whether "
+            "the intent was classified as short or long. "
+            "It sends the YouTube URL directly to Gemini using a native video ingestion feature "
+            "(`file_data` with a YouTube URI), capped at the first 10 minutes to control cost. "
+            "Gemini watches the video and returns the exact `start_seconds` and `end_seconds` "
+            "of the segment that best answers the query, plus a one-sentence reasoning. "
+            "The YouTube embed is then loaded with `?start=X&end=Y` parameters so playback jumps "
+            "directly to that moment and stops when the clip ends."
+        )
+
+        st.divider()
+
+        st.markdown("### Decision tree — when does a video appear?")
+        st.code(
+            "User submits query\n"
+            "│\n"
+            "├─ Intent Classifier runs (always)\n"
+            "│   ├─ has_visual_intent = False  →  TEXT ONLY in both columns\n"
+            "│   └─ has_visual_intent = True\n"
+            "│       ├─ YouTube Search runs\n"
+            "│       │   ├─ No results found  →  TEXT ONLY + 'No relevant video found'\n"
+            "│       │   └─ Video found\n"
+            "│       │       ├─ Video ≤ 60 s  →  EMBED from 0:00 (genuine Short)\n"
+            "│       │       └─ Video > 60 s  →  Timestamp Picker runs\n"
+            "│       │           ├─ Valid timestamp returned  →  EMBED at start_seconds → end_seconds\n"
+            "│       │           └─ Invalid / error           →  EMBED from 0:00 (safe fallback)\n"
+            "│\n"
+            "Control column: video only if the word 'video' appears in the query (today's behavior)",
+            language="text",
+        )
+
+        st.divider()
+
+        st.markdown("### Parallelism & latency")
+        st.markdown(
+            "To minimize wait time, the **text answer** and the **Intent Classifier** run in parallel "
+            "using Python's `concurrent.futures.ThreadPoolExecutor`. "
+            "The YouTube and Timestamp agents run sequentially after, since each depends on the previous result. "
+            "Total latency is typically **4–12 seconds** depending on video length and API load. "
+            "On transient Gemini overload (503 errors), each call automatically retries up to 3 times "
+            "with exponential backoff (2 s → 4 s → 8 s) before surfacing an error."
+        )
 
 
 def main() -> None:
@@ -521,6 +642,7 @@ def main() -> None:
 
         st.divider()
         render_agent_pipeline(result)
+        render_how_it_works()
 
 
 if __name__ == "__main__":
