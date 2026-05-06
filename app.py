@@ -203,8 +203,8 @@ def run_pipeline(query: str) -> dict:
 
 def render_sidebar() -> None:
     with st.sidebar:
-        st.markdown("## 🔍 Visual Intent Detection")
-        st.markdown("*A Gemini feature prototype*")
+        st.markdown("## 🔍 Gemini VideoSense")
+        st.markdown("*Visual Intent Detection Prototype*")
         st.divider()
 
         st.markdown("**The problem**")
@@ -261,17 +261,19 @@ def render_search_ui() -> None:
                 st.rerun()
 
     st.markdown("")
-    inp_col, btn_col = st.columns([6, 1])
-    with inp_col:
-        st.text_input(
-            "query",
-            key="query_input",
-            max_chars=MAX_QUERY_LEN,
-            placeholder="Or ask anything...",
-            label_visibility="collapsed",
-        )
-    with btn_col:
-        if st.button("Search", type="primary", use_container_width=True):
+    with st.form("search_form", clear_on_submit=False):
+        inp_col, btn_col = st.columns([6, 1])
+        with inp_col:
+            st.text_input(
+                "query",
+                key="query_input",
+                max_chars=MAX_QUERY_LEN,
+                placeholder="Or ask anything...",
+                label_visibility="collapsed",
+            )
+        with btn_col:
+            submitted = st.form_submit_button("Search", type="primary", use_container_width=True)
+        if submitted:
             st.session_state.do_run = True
 
 
@@ -466,6 +468,48 @@ def render_agent_pipeline(result: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+def render_error_banner(result: dict) -> None:
+    """Show a friendly top-of-page notice when something didn't come back."""
+    errors = result.get("errors", {})
+    text_missing = not result.get("text_answer", "").strip()
+    intent_failed = result.get("intent") is None
+    youtube_expected = (
+        result.get("intent") and result["intent"].has_visual_intent
+        and result.get("youtube_result") is None
+    )
+
+    issues = []
+
+    if text_missing or "text_answer" in errors:
+        issues.append(
+            "**No text answer returned.** The Gemini API may be overloaded. "
+            "Wait a moment and try the same query again."
+        )
+    if intent_failed:
+        issues.append(
+            "**Intent Classifier failed.** Gemini couldn't classify your query — "
+            "the Treatment column can't decide whether to show a video. "
+            "Try again in a few seconds."
+        )
+    if youtube_expected and "youtube" in errors:
+        issues.append(
+            "**YouTube Search failed.** The YouTube API returned an error — "
+            "check that your API key is valid and the YouTube Data API v3 is enabled "
+            "in your Google Cloud project."
+        )
+    if youtube_expected and "youtube" not in errors:
+        issues.append(
+            "**No video found** for this query. Try rephrasing — "
+            "e.g. add 'how to' or be more specific."
+        )
+
+    if not issues:
+        return
+
+    banner_lines = "\n\n".join(f"⚠️ {i}" for i in issues)
+    st.warning(banner_lines)
+
+
 def render_how_it_works() -> None:
     with st.expander("📖  How this prototype works", expanded=False):
 
@@ -589,7 +633,7 @@ def render_how_it_works() -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="Visual Intent Detection — Gemini Prototype",
+        page_title="Gemini VideoSense — Visual Intent Detection Prototype",
         page_icon="🔍",
         layout="wide",
     )
@@ -597,10 +641,11 @@ def main() -> None:
     _init_state()
     render_sidebar()
 
-    st.title("Visual Intent Detection")
+    st.title("Gemini VideoSense")
     st.caption(
-        "A prototype showing how Gemini could automatically detect when a query "
-        "needs a video answer — and embed the right clip at the right moment."
+        "Visual Intent Detection Prototype · A prototype showing how Gemini could "
+        "automatically detect when a query needs a video answer — and embed the "
+        "right clip at the right moment."
     )
     st.divider()
 
@@ -634,6 +679,7 @@ def main() -> None:
     if st.session_state.last_result:
         result = st.session_state.last_result
         st.divider()
+        render_error_banner(result)
         left, right = st.columns(2, gap="large")
         with left:
             render_control_column(result["query"], result["text_answer"])
