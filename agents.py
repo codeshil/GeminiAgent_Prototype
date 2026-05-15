@@ -1,318 +1,384 @@
-"""The three Visual Intent Detection agents, plus a small helper for the
-plain text answer used in both columns.
-
-Each function is independently callable from a Python REPL — useful when the
-user wants to debug one agent without spinning up Streamlit.
-"""
-
+"""AI agents for Visual Intent Detection."""
 from __future__ import annotations
 
 import os
 import re
 import time
-from typing import Literal, Optional
+from functools import wraps
+from typing import Optional
 
-from pydantic import BaseModel, Field
-
+import requests
 from google import genai
-from google.genai import types as genai_types
-from googleapiclient.discovery import build as build_youtube_client
-
-import prompts
+from google.genai import types
+from pydantic import BaseModel
 
 
-# ---------------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------------
-
+# ── Pydantic models ──────────────────────────────────────────────────────────
 
 class VisualIntent(BaseModel):
     has_visual_intent: bool
-    format: Literal["short", "long", "none"]
-    confidence: float = Field(ge=0.0, le=1.0)
+    format: str          # "short" | "long" | "none"
+    confidence: float
     rationale: str
-
-
-class TimestampPick(BaseModel):
-    start_seconds: int = Field(ge=0)
-    end_seconds: int = Field(ge=0)
-    reasoning: str
 
 
 class YouTubeResult(BaseModel):
     video_id: str
+    video_url: str
     title: str
     channel: str
-    duration: str       # ISO 8601 raw (e.g. "PT3M21S") — kept for the trace
-    duration_secs: int  # parsed seconds — used for Short detection
-    thumbnail_url: str
-    video_url: str
-    views: int = 0
-    likes: Optional[int] = None  # often hidden by creators; may be None
-    search_query_used: str = ""  # the optimized query sent to YouTube
-    is_short: bool = False       # True when duration ≤ 90 s
+    views: int
+    likes: Optional[int] = None
+    duration_secs: int
+    is_short: bool
+    search_query_used: str
 
 
-# ---------------------------------------------------------------------------
-# Retry helper
-# ---------------------------------------------------------------------------
-
-_RETRYABLE = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")
-_MAX_ATTEMPTS = 3
+class TimestampPick(BaseModel):
+    start_seconds: int
+    end_seconds: int
+    reasoning: str
 
 
-def _with_retry(fn, *args, **kwargs):
-    """Call fn(*args, **kwargs), retrying up to _MAX_ATTEMPTS times on
-    transient Gemini errors (503 overload, 429 rate-limit) with exponential
-    backoff (2 s → 4 s → 8 s)."""
-    for attempt in range(_MAX_ATTEMPTS):
-        try:
-            return fn(*args, **kwargs)
-        except Exception as e:
-            msg = str(e)
-            retryable = any(code in msg for code in _RETRYABLE)
-            if retryable and attempt < _MAX_ATTEMPTS - 1:
-                time.sleep(2.0 * (2 ** attempt))  # 2 s, 4 s, 8 s
-                continue
-            raise
+class VerificationResult(BaseModel):
+    is_good_match: bool
+    verdict: str                              # "strong_match" | "partial_match" | "poor_match"
+    confidence: float
+    explanation: str
+    timestamp_is_correct: bool                # does the proposed timestamp actually answer the query?
+    timestamp_explanation: str                # one sentence on why / why not
+    corrected_start_seconds: Optional[int] = None   # agent's suggested better start if timestamp is wrong
 
 
-# ---------------------------------------------------------------------------
-# Clients (built lazily so import-time has no side effects)
-# ---------------------------------------------------------------------------
+# ── Gemini client ────────────────────────────────────────────────────────────
+
+def _get_client() -> genai.Client:
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise ValueError("GEMINI_API_KEY environment variable is not set.")
+    return genai.Client(api_key=key)
 
 
-def _gemini_client() -> genai.Client:
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not set")
-    return genai.Client(api_key=api_key)
+# ── Retry helper ─────────────────────────────────────────────────────────────
+
+def _retry(max_attempts: int = 3, base_delay: float = 2.0):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            last_exc: Exception | None = None
+            for attempt in range(max_attempts):
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < max_attempts - 1:
+                        time.sleep(base_delay * (2 ** attempt))
+            raise last_exc  # type: ignore[misc]
+        return wrapper
+    return decorator
 
 
-def _youtube_client():
-    api_key = os.environ.get("YOUTUBE_API_KEY")
-    if not api_key:
-        raise RuntimeError("YOUTUBE_API_KEY is not set")
-    return build_youtube_client("youtube", "v3", developerKey=api_key)
+# ── ISO 8601 duration → seconds ──────────────────────────────────────────────
+
+def _iso_to_secs(duration: str) -> int:
+    h = int((re.search(r"(\d+)H", duration) or (None, 0))[1])
+    m = int((re.search(r"(\d+)M", duration) or (None, 0))[1])
+    s = int((re.search(r"(\d+)S", duration) or (None, 0))[1])
+    return h * 3600 + m * 60 + s
 
 
-# ---------------------------------------------------------------------------
-# Agent 1: classify_visual_intent
-# ---------------------------------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+# Agent 1 — Text Answer
+# ══════════════════════════════════════════════════════════════════════════════
 
-
-def classify_visual_intent(query: str) -> VisualIntent:
-    """Classify whether the query has visual intent and which video format fits."""
-    client = _gemini_client()
-    response = _with_retry(
-        client.models.generate_content,
-        model="gemini-2.5-flash",
-        contents=prompts.build_visual_intent_user_prompt(query),
-        config=genai_types.GenerateContentConfig(
-            system_instruction=prompts.VISUAL_INTENT_SYSTEM,
-            response_mime_type="application/json",
-            response_schema=VisualIntent,
-        ),
-    )
-    parsed = response.parsed
-    if isinstance(parsed, VisualIntent):
-        return parsed
-    return VisualIntent.model_validate_json(response.text)
-
-
-# ---------------------------------------------------------------------------
-# Agent 2: find_youtube_video
-# ---------------------------------------------------------------------------
-
-_ISO_DURATION_RE = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
-_SHORT_THRESHOLD_SECS = 90   # videos ≤ this are treated as YouTube Shorts
-_SHORT_BOOST = 3.0           # engagement multiplier for Shorts when format="short"
-
-
-def _parse_duration_secs(iso: str) -> int:
-    m = _ISO_DURATION_RE.match(iso)
-    if not m:
-        return 0
-    h, mins, s = (int(x or 0) for x in m.groups())
-    return h * 3600 + mins * 60 + s
-
-
-def _optimize_search_query(query: str, format: Literal["short", "long"]) -> str:
-    """Rewrite the raw user query into a tight YouTube search string."""
-    client = _gemini_client()
-    response = _with_retry(
-        client.models.generate_content,
-        model="gemini-2.5-flash",
-        contents=prompts.build_search_query_prompt(query, format),
-    )
-    optimized = (response.text or query).strip().strip('"').strip("'")
-    return optimized if optimized else query
-
-
-def find_youtube_video(
-    query: str, format: Literal["short", "long"]
-) -> Optional[YouTubeResult]:
-    """Search YouTube and return the best video for the requested format.
-
-    For "short": filter videoDuration=short (<4 min), rank by relevance + view count.
-    For "long":  filter videoDuration=medium|long, rank by relevance + view count + recency.
-    Returns None when nothing usable comes back.
-    """
-    youtube = _youtube_client()
-    search_query = _optimize_search_query(query, format)
-    # For short-form intent, appending "shorts" makes YouTube's search
-    # surface actual Shorts rather than burying them under longer tutorials.
-    if format == "short":
-        search_query = search_query + " shorts"
-
-    # videoDuration only accepts one value at a time; for "long" we ask
-    # for "medium" first and fall back to "long".
-    duration_filters = ["short"] if format == "short" else ["medium", "long"]
-
-    candidates: list[dict] = []
-    for duration in duration_filters:
-        search = (
-            youtube.search()
-            .list(
-                q=search_query,
-                part="snippet",
-                type="video",
-                videoDuration=duration,
-                maxResults=10,
-                order="relevance",
-                safeSearch="moderate",
-            )
-            .execute()
-        )
-        for item in search.get("items", []):
-            vid = item["id"].get("videoId")
-            if vid:
-                candidates.append({"id": vid, "snippet": item["snippet"]})
-
-    if not candidates:
-        return None
-
-    # Hydrate with statistics + contentDetails so we can rank by views.
-    ids = ",".join(c["id"] for c in candidates)
-    details = (
-        youtube.videos()
-        .list(part="statistics,contentDetails,snippet", id=ids)
-        .execute()
-    )
-
-    enriched = []
-    for v in details.get("items", []):
-        stats = v.get("statistics", {})
-        try:
-            views = int(stats.get("viewCount", "0"))
-        except ValueError:
-            views = 0
-        likes: Optional[int] = None
-        if "likeCount" in stats:
-            try:
-                likes = int(stats["likeCount"])
-            except ValueError:
-                pass
-        iso_dur = v["contentDetails"]["duration"]
-        dur_secs = _parse_duration_secs(iso_dur)
-        enriched.append(
-            {
-                "video_id": v["id"],
-                "title": v["snippet"]["title"],
-                "channel": v["snippet"]["channelTitle"],
-                "duration": iso_dur,
-                "duration_secs": dur_secs,
-                "thumbnail_url": v["snippet"]["thumbnails"]["high"]["url"],
-                "published_at": v["snippet"].get("publishedAt", ""),
-                "views": views,
-                "likes": likes,
-            }
-        )
-
-    if not enriched:
-        return None
-
-    # Ranking: compete only within the top 5 relevance results so a viral
-    # unrelated video ranked #8 can't beat the #1 relevant result.
-    #
-    # For "short" format, genuine Shorts (≤ 90 s) get a 1.5× view-count boost
-    # so they win over similar-quality regular videos — but a tutorial with 10×
-    # more views still beats a low-engagement Short.
-    top5 = enriched[:5]
-    for item in top5:
-        is_short_video = 0 < item["duration_secs"] <= _SHORT_THRESHOLD_SECS
-        boost = _SHORT_BOOST if (format == "short" and is_short_video) else 1.0
-        item["score"] = item["views"] * boost
-
-    if format == "long":
-        top5.sort(key=lambda x: (x["score"], x["published_at"]), reverse=True)
-    else:
-        top5.sort(key=lambda x: x["score"], reverse=True)
-
-    top = top5[0]
-    is_short = 0 < top["duration_secs"] <= _SHORT_THRESHOLD_SECS
-    return YouTubeResult(
-        video_id=top["video_id"],
-        title=top["title"],
-        channel=top["channel"],
-        duration=top["duration"],
-        duration_secs=top["duration_secs"],
-        thumbnail_url=top["thumbnail_url"],
-        video_url=f"https://www.youtube.com/watch?v={top['video_id']}",
-        views=top["views"],
-        likes=top["likes"],
-        search_query_used=search_query,
-        is_short=is_short,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Agent 3: find_timestamp
-# ---------------------------------------------------------------------------
-
-
-def find_timestamp(query: str, video_url: str) -> TimestampPick:
-    """Ask Gemini to identify the start/end seconds inside the video that
-    answer the query. Caps processing at the first 10 minutes via VideoMetadata
-    to control cost.
-    """
-    client = _gemini_client()
-    response = _with_retry(
-        client.models.generate_content,
-        model="gemini-2.5-flash",
-        contents=genai_types.Content(
-            parts=[
-                genai_types.Part(
-                    file_data=genai_types.FileData(file_uri=video_url),
-                    video_metadata=genai_types.VideoMetadata(
-                        start_offset="0s",
-                        end_offset="600s",
-                    ),
-                ),
-                genai_types.Part(text=prompts.build_timestamp_prompt(query)),
-            ]
-        ),
-        config=genai_types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=TimestampPick,
-        ),
-    )
-    parsed = response.parsed
-    if isinstance(parsed, TimestampPick):
-        return parsed
-    return TimestampPick.model_validate_json(response.text)
-
-
-# ---------------------------------------------------------------------------
-# Plain text answer (used in BOTH Control and Treatment columns)
-# ---------------------------------------------------------------------------
-
-
+@_retry()
 def generate_text_answer(query: str) -> str:
-    client = _gemini_client()
-    response = _with_retry(
-        client.models.generate_content,
+    client = _get_client()
+    response = client.models.generate_content(
         model="gemini-2.5-flash",
-        contents=prompts.build_text_answer_prompt(query),
+        contents=query,
+        config=types.GenerateContentConfig(
+            system_instruction=(
+                "You are a helpful, concise assistant. Answer the user's query in "
+                "2–4 sentences. Be factual and clear. Do not suggest looking for a video."
+            ),
+            max_output_tokens=350,
+        ),
     )
-    return (response.text or "").strip()
+    return response.text or ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Agent 2 — Visual Intent Classifier
+# ══════════════════════════════════════════════════════════════════════════════
+
+_INTENT_EXAMPLES = """
+Examples (few-shot):
+Q: "how do I replace a bike tire"        → has_visual_intent=true,  format="long",  confidence=0.97, rationale="Multi-step physical task requiring sight of hand positions and tools."
+Q: "show me a kettlebell swing"          → has_visual_intent=true,  format="short", confidence=0.96, rationale="Form-check movement best shown in a 30–60 s clip."
+Q: "what is the capital of France"       → has_visual_intent=false, format="none",  confidence=0.99, rationale="Single-word factual answer; no visual component."
+Q: "how does a transistor work"          → has_visual_intent=true,  format="long",  confidence=0.85, rationale="Abstract electronics concept benefits from animated diagram explainer."
+Q: "what causes inflation"               → has_visual_intent=false, format="none",  confidence=0.88, rationale="Economic concept explained well in text; no spatial component."
+Q: "how to fold a fitted sheet"          → has_visual_intent=true,  format="short", confidence=0.96, rationale="Classic short physical demo — ideal for a 60–90 s clip."
+Q: "tell me about sourdough"             → has_visual_intent=false, format="none",  confidence=0.72, rationale="Open-ended; text is sufficient."
+Q: "how to do a pivot table in Excel"   → has_visual_intent=true,  format="long",  confidence=0.93, rationale="UI walkthrough requires seeing each step."
+Q: "tie a Windsor knot"                  → has_visual_intent=true,  format="short", confidence=0.95, rationale="Precise hand movements need visual demonstration."
+Q: "history of the Roman Empire"        → has_visual_intent=false, format="none",  confidence=0.91, rationale="Historical narrative; text or reading is the right medium."
+"""
+
+
+class _IntentSchema(BaseModel):
+    has_visual_intent: bool
+    format: str
+    confidence: float
+    rationale: str
+
+
+@_retry()
+def classify_visual_intent(query: str) -> VisualIntent:
+    client = _get_client()
+    prompt = (
+        f"{_INTENT_EXAMPLES}\n\n"
+        f'Now classify: Q: "{query}"\n\n'
+        "Return JSON with has_visual_intent (bool), format ('short'|'long'|'none'), "
+        "confidence (0–1), rationale (one sentence)."
+    )
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=_IntentSchema,
+        ),
+    )
+    data = _IntentSchema.model_validate_json(resp.text)
+    return VisualIntent(**data.model_dump())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Agent 3 — YouTube Search
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _optimize_query(query: str, fmt: str) -> str:
+    """Rewrite user query into an optimized YouTube search string."""
+    suffix = "shorts tutorial" if fmt == "short" else "tutorial"
+    try:
+        client = _get_client()
+        resp = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=(
+                f'Rewrite into a YouTube search string (3–6 words, no quotes) '
+                f'for a {fmt}-form video. Append "{suffix.split()[0]}" if natural. '
+                f'Query: "{query}". Return ONLY the search string.'
+            ),
+            config=types.GenerateContentConfig(max_output_tokens=25),
+        )
+        return resp.text.strip().strip('"') or query
+    except Exception:
+        return query
+
+
+@_retry()
+def find_youtube_video(query: str, fmt: str) -> Optional[YouTubeResult]:
+    yt_key = os.environ.get("YOUTUBE_API_KEY")
+    if not yt_key:
+        raise ValueError("YOUTUBE_API_KEY environment variable is not set.")
+
+    search_q = _optimize_query(query, fmt)
+    dur_filter = "short" if fmt == "short" else "any"
+
+    # Search
+    search = requests.get(
+        "https://www.googleapis.com/youtube/v3/search",
+        params={
+            "part": "snippet",
+            "q": search_q,
+            "type": "video",
+            "videoDuration": dur_filter,
+            "maxResults": 5,
+            "relevanceLanguage": "en",
+            "key": yt_key,
+        },
+        timeout=10,
+    )
+    search.raise_for_status()
+    items = search.json().get("items", [])
+    if not items:
+        return None
+
+    # Fetch stats + duration
+    ids = [it["id"]["videoId"] for it in items]
+    stats_resp = requests.get(
+        "https://www.googleapis.com/youtube/v3/videos",
+        params={
+            "part": "statistics,contentDetails,snippet",
+            "id": ",".join(ids),
+            "key": yt_key,
+        },
+        timeout=10,
+    )
+    stats_resp.raise_for_status()
+    stats_map = {it["id"]: it for it in stats_resp.json().get("items", [])}
+
+    best: Optional[YouTubeResult] = None
+    best_score = -1
+
+    for item in items:
+        vid_id = item["id"]["videoId"]
+        if vid_id not in stats_map:
+            continue
+        st = stats_map[vid_id]
+        views = int(st["statistics"].get("viewCount", 0))
+        likes_raw = st["statistics"].get("likeCount")
+        likes = int(likes_raw) if likes_raw else None
+        dur = _iso_to_secs(st["contentDetails"]["duration"])
+        is_short = dur <= 90
+
+        score = views * (3 if fmt == "short" and is_short else 1)
+        if score > best_score:
+            best_score = score
+            best = YouTubeResult(
+                video_id=vid_id,
+                video_url=f"https://www.youtube.com/watch?v={vid_id}",
+                title=item["snippet"]["title"],
+                channel=item["snippet"]["channelTitle"],
+                views=views,
+                likes=likes,
+                duration_secs=dur,
+                is_short=is_short,
+                search_query_used=search_q,
+            )
+
+    return best
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Agent 4 — Timestamp Picker
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _TsSchema(BaseModel):
+    start_seconds: int
+    end_seconds: int
+    reasoning: str
+
+
+@_retry()
+def find_timestamp(query: str, video_url: str) -> TimestampPick:
+    client = _get_client()
+    prompt = (
+        f'Watch this video (first 10 min only). Find the 30–120 second segment '
+        f'that best answers: "{query}". '
+        f"Return start_seconds, end_seconds, and a one-sentence reasoning."
+    )
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            types.Part(file_data=types.FileData(file_uri=video_url)),
+            prompt,
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=_TsSchema,
+        ),
+    )
+    data = _TsSchema.model_validate_json(resp.text)
+    return TimestampPick(**data.model_dump())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Agent 5 — Verification Agent
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _VerifySchema(BaseModel):
+    is_good_match: bool
+    verdict: str                          # "strong_match" | "partial_match" | "poor_match"
+    confidence: float
+    explanation: str
+    timestamp_is_correct: bool            # does the clip at start_seconds actually answer the query?
+    timestamp_explanation: str            # one sentence explaining the timestamp verdict
+    corrected_start_seconds: Optional[int] = None   # agent's better start if timestamp is wrong
+
+
+@_retry()
+def verify_video_match(
+    query: str,
+    yt: YouTubeResult,
+    ts: Optional[TimestampPick] = None,
+) -> VerificationResult:
+    """
+    Quality-gate agent: watches the actual video at the proposed timestamp
+    using Gemini's native video ingestion, then independently verifies:
+      1. Is this the right video for the query?
+      2. Is the proposed timestamp actually the right moment?
+         If not, it suggests a corrected start time.
+    """
+    client = _get_client()
+
+    def _fmt(secs: int) -> str:
+        return f"{secs // 60}:{secs % 60:02d}"
+
+    if ts:
+        ts_meta = (
+            f"\nProposed clip  : {_fmt(ts.start_seconds)} → {_fmt(ts.end_seconds)}"
+            f" ({ts.start_seconds}s – {ts.end_seconds}s)"
+            f"\nTimestamp note : {ts.reasoning}"
+        )
+        timestamp_instruction = (
+            "Watch the video. Specifically, check what is happening at the proposed "
+            f"clip ({_fmt(ts.start_seconds)} → {_fmt(ts.end_seconds)}). "
+            "Decide whether that exact moment genuinely answers the query. "
+            "If the content at that timestamp is an intro, unrelated topic, or not yet "
+            "at the relevant moment, set timestamp_is_correct=false and provide a "
+            "corrected_start_seconds that points to the better moment. "
+            "If the clip is correct, set timestamp_is_correct=true and "
+            "corrected_start_seconds=null."
+        )
+    else:
+        ts_meta = "\nNo timestamp proposed — video will play from 0:00."
+        timestamp_instruction = (
+            "Watch the video. Identify the best start time (in seconds) for the query. "
+            "Set timestamp_is_correct=false and corrected_start_seconds=<best start>. "
+            "If the video genuinely starts at the right moment from 0:00, "
+            "set timestamp_is_correct=true and corrected_start_seconds=null."
+        )
+
+    prompt = f"""You are a quality-verification agent for a video recommendation system.
+Your job is to watch the actual video and verify both the video relevance AND the timestamp accuracy.
+
+User query     : "{query}"
+Video title    : "{yt.title}"
+Channel        : "{yt.channel}"
+Duration       : {yt.duration_secs}s{ts_meta}
+
+TASK 1 — Video relevance:
+Rate whether this video answers the query:
+- "strong_match"  : clearly addresses the query; format fits the task.
+- "partial_match" : related but may not fully cover the specific query.
+- "poor_match"    : off-topic, misleading, or wrong format.
+
+TASK 2 — Timestamp accuracy:
+{timestamp_instruction}
+
+Return JSON:
+  is_good_match           : true if verdict is strong_match or partial_match
+  verdict                 : "strong_match" | "partial_match" | "poor_match"
+  confidence              : 0.0–1.0
+  explanation             : one sentence on video relevance
+  timestamp_is_correct    : bool
+  timestamp_explanation   : one sentence on whether the timestamp points to the right moment
+  corrected_start_seconds : int or null
+"""
+    # Watch the actual video — same capability used by the timestamp picker
+    resp = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            types.Part(file_data=types.FileData(file_uri=yt.video_url)),
+            prompt,
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=_VerifySchema,
+        ),
+    )
+    data = _VerifySchema.model_validate_json(resp.text)
+    return VerificationResult(**data.model_dump())
