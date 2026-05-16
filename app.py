@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -444,7 +445,13 @@ def render_search_ui() -> None:
         st.session_state.query_input = st.session_state.pop("pending_chip")
 
     # Header
-    hour = datetime.now().hour
+    # Use the browser's timezone — Streamlit Cloud servers run UTC, so without this
+    # the greeting would be wrong for non-UTC viewers (e.g. evening in LA -> "morning").
+    try:
+        tz = ZoneInfo(st.context.timezone)
+    except Exception:
+        tz = ZoneInfo("America/Los_Angeles")
+    hour = datetime.now(tz).hour
     greeting = (
         "Good morning" if hour < 12
         else "Good afternoon" if hour < 18
