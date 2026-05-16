@@ -1,16 +1,11 @@
-# Secrets
-.env
 .streamlit/secrets.toml
-
-# Python
+.env
 __pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-.pytest_cache/
-
-# OS / editor
+*.pyc
 .DS_Store
-.idea/
-.vscode/
+venv/
+.venv/
+
+# Persistent query log (contains user-typed queries — never commit)
+*.jsonl
+videosense_log.jsonl
