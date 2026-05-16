@@ -1,6 +1,7 @@
 """Streamlit UI — Visual Intent Detection · Gemini VideoSense"""
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -313,6 +314,36 @@ iframe { border-radius: 14px; }
     .col-card, .pipe-card, .vs-thinking-dot, .vs-thinking-bar { animation: none !important; }
     .vs-thinking-bar { background-position: 0 0; }
 }
+
+/* ══ Video carousel ══ */
+.carousel-intro {
+    font-size: 0.92rem; line-height: 1.5;
+    color: var(--g-text-2);
+    margin: 14px 0 10px 0;
+}
+.carousel-intro b {
+    color: var(--g-text);
+    font-weight: 600;
+    display: block; margin-bottom: 2px;
+}
+.carousel-sub { color: var(--g-text-3); font-size: 0.86rem; }
+.carousel-counter {
+    text-align: center;
+    font-size: 0.84rem; color: var(--g-text-2); font-weight: 500;
+    padding-top: 10px;
+}
+.carousel-dots {
+    display: inline-flex; gap: 6px;
+    margin-left: 10px; vertical-align: middle;
+}
+.carousel-dot {
+    width: 7px; height: 7px;
+    border-radius: 999px;
+    background: #dadce0;
+    display: inline-block;
+    transition: background 0.2s;
+}
+.carousel-dot-active { background: var(--g-blue); }
 </style>
 """
 
@@ -338,6 +369,8 @@ def _init() -> None:
         "do_run": False,
         "last_result": None,
         "history": [],
+        "current_video_idx": 0,    # which video the carousel is showing
+        "session_log": [],         # full per-query agent trace (for professor review)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -547,10 +580,16 @@ def render_verification(v) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def render_error_banners(result: dict) -> None:
-    errors = result.get("errors", {})
-    intent = result.get("intent")
-    yt = result.get("youtube_result")
+    """Top-level banners for *global* pipeline failures only.
 
+    Per-video failures (timestamp, verification) are surfaced in each video's
+    verification badge area + the Agent Pipeline expander, not here. And the
+    "no videos found" outcome is shown inline in render_treatment as a warning —
+    no top-level banner needed for that legitimate (non-error) case.
+    """
+    errors = result.get("errors", {})
+
+    # Text answer failed
     if "text_answer" in errors or not result.get("text_answer", "").strip():
         st.markdown(
             '<div class="err-banner"><span class="banner-icon">❌</span>'
@@ -561,6 +600,7 @@ def render_error_banners(result: dict) -> None:
             unsafe_allow_html=True,
         )
 
+    # Intent classifier failed
     if "visual_intent" in errors:
         st.markdown(
             '<div class="err-banner"><span class="banner-icon">❌</span>'
@@ -571,32 +611,14 @@ def render_error_banners(result: dict) -> None:
             unsafe_allow_html=True,
         )
 
-    if intent and intent.has_visual_intent and "youtube" in errors:
+    # YouTube API itself errored (network / key / quota — different from "no results")
+    if "youtube" in errors:
         st.markdown(
             '<div class="err-banner"><span class="banner-icon">❌</span>'
             '<div class="banner-text"><b>YouTube Search failed</b>'
             'Check that your YOUTUBE_API_KEY is valid and the YouTube Data API v3 '
             f'is enabled in your Google Cloud project. '
             f'<code>{str(errors.get("youtube",""))[:80]}</code>'
-            '</div></div>',
-            unsafe_allow_html=True,
-        )
-
-    if intent and intent.has_visual_intent and not yt and "youtube" not in errors:
-        st.markdown(
-            '<div class="warn-banner"><span class="banner-icon">⚠️</span>'
-            '<div class="banner-text"><b>No video found</b>'
-            "Try rephrasing — add 'how to' or be more specific."
-            '</div></div>',
-            unsafe_allow_html=True,
-        )
-
-    if "timestamp" in errors:
-        st.markdown(
-            '<div class="warn-banner"><span class="banner-icon">⚠️</span>'
-            '<div class="banner-text"><b>Timestamp Picker failed</b>'
-            'Playing from the start instead. '
-            f'<code>{str(errors.get("timestamp",""))[:80]}</code>'
             '</div></div>',
             unsafe_allow_html=True,
         )
@@ -614,9 +636,11 @@ def render_control(query: str, text_answer: str) -> None:
         unsafe_allow_html=True,
     )
 
-    # Text answer
+    # Text answer — st.markdown parses markdown (headings, lists, bold) properly.
+    # Don't wrap in raw HTML: Streamlit's markdown parser doesn't process markdown
+    # syntax inside HTML blocks, so headers/lists would render as literal characters.
     if text_answer:
-        st.markdown(f'<div class="text-answer">{text_answer}</div>', unsafe_allow_html=True)
+        st.markdown(text_answer)
     else:
         st.markdown(
             '<div class="info-banner"><span class="banner-icon">ℹ️</span>'
@@ -668,71 +692,48 @@ def _intent_badge_html(intent) -> str:
     return badge("▶ long video + timestamp", "blue")
 
 
-def render_treatment(result: dict) -> None:
-    intent = result.get("intent")
-    yt     = result.get("youtube_result")
-    ts     = result.get("timestamp_pick")
-    verif  = result.get("verification")
-
-    st.markdown('<div class="col-card col-card-treatment">', unsafe_allow_html=True)
-    st.markdown(
-        f'<p class="col-title col-label-treatment">'
-        f'<span class="col-dot col-dot-treatment"></span>TREATMENT · Visual Intent Detection '
-        f'&nbsp;{_intent_badge_html(intent)}</p>',
-        unsafe_allow_html=True,
-    )
-
-    # Text answer
-    if result.get("text_answer"):
+def _render_carousel_controls(idx: int, total: int) -> None:
+    """Prev/next arrows + 'Video X of Y' counter + dot indicators."""
+    col_l, col_c, col_r = st.columns([1, 4, 1])
+    with col_l:
+        if st.button("◀", key="carousel_prev",
+                     disabled=(idx == 0), use_container_width=True):
+            st.session_state.current_video_idx = max(0, idx - 1)
+            st.rerun()
+    with col_c:
+        dots = "".join(
+            f'<span class="carousel-dot{" carousel-dot-active" if i == idx else ""}"></span>'
+            for i in range(total)
+        )
         st.markdown(
-            f'<div class="text-answer">{result["text_answer"]}</div>',
+            f'<div class="carousel-counter">Video {idx + 1} of {total}'
+            f'<span class="carousel-dots">{dots}</span></div>',
             unsafe_allow_html=True,
         )
+    with col_r:
+        if st.button("▶", key="carousel_next",
+                     disabled=(idx == total - 1), use_container_width=True):
+            st.session_state.current_video_idx = min(total - 1, idx + 1)
+            st.rerun()
 
-    # Intent failed
-    if not intent:
-        st.markdown(
-            '<div class="err-banner"><span class="banner-icon">❌</span>'
-            '<div class="banner-text"><b>Intent classifier failed</b>'
-            'Cannot determine whether to show a video. See pipeline below.</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
-        return
 
-    # Text-only intent
-    if not intent.has_visual_intent or intent.format == "none":
-        conf = f"{intent.confidence:.0%}"
-        st.markdown(
-            f'<div class="info-banner"><span class="banner-icon">💬</span>'
-            f'<div class="banner-text"><b>Text is the right medium</b>'
-            f'{intent.rationale} ({conf} confident)</div></div>',
-            unsafe_allow_html=True,
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
-        return
+def _render_video_card(current: dict) -> None:
+    """Per-video block: verification badge → correction notice → meta → title → embed.
 
-    # No video found
-    if not yt:
-        st.markdown(
-            '<div class="warn-banner"><span class="banner-icon">⚠️</span>'
-            '<div class="banner-text"><b>No relevant video found</b>'
-            "Try rephrasing or adding 'how to'.</div></div>",
-            unsafe_allow_html=True,
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
-        return
+    Reused by both the carousel (for the currently-selected video) and the
+    single-video path (long-form strong match → no carousel UI).
+    """
+    yt = current["yt"]
+    ts = current.get("ts")
+    verif = current.get("verif")
 
-    # ── Video found ──────────────────────────────────────────────────────────
-    st.markdown('<br>', unsafe_allow_html=True)
-
-    # Verification strip — video relevance
+    # Verification strip — the trust signal
     render_verification(verif)
 
-    # Timestamp correction notice (shown when verification overrode the picker)
-    if result.get("timestamp_corrected"):
-        orig = fmt_ts(result.get("timestamp_original_start", 0))
-        new  = fmt_ts(ts.start_seconds) if ts else "0:00"
+    # Timestamp correction notice (only when verification overrode the picker)
+    if current.get("timestamp_corrected"):
+        orig = fmt_ts(current.get("timestamp_original_start", 0))
+        new = fmt_ts(ts.start_seconds) if ts else "0:00"
         st.markdown(
             f'<div class="verify-strip verify-partial">'
             f'<span class="verify-icon">🔧</span>'
@@ -755,7 +756,7 @@ def render_treatment(result: dict) -> None:
         unsafe_allow_html=True,
     )
 
-    # Framing sentence
+    # Framing sentence + embed
     if ts:
         st.markdown(
             f"**{yt.title}** by *{yt.channel}*  \n"
@@ -769,6 +770,154 @@ def render_treatment(result: dict) -> None:
     else:
         st.markdown(f"**{yt.title}** by *{yt.channel}*")
         st.video(yt.video_url)
+
+
+def _render_carousel_block(videos: list, intro_mode: str) -> None:
+    """Render the carousel: intro + current video card + arrow controls.
+
+    intro_mode:
+      - 'video_first' → short-form, "Best answered with a video" framing
+      - 'long_weak'   → long-form with weak top match, "alternates" framing
+      - 'fallback'    → generic framing for other cases
+    """
+    total = len(videos)
+    idx = st.session_state.get("current_video_idx", 0)
+    idx = max(0, min(idx, total - 1))  # defensive clamp
+    current = videos[idx]
+
+    if intro_mode == "video_first":
+        intro_main = "Best answered with a video"
+        intro_sub = (
+            f"Here are {total} picks — tap the arrows to browse."
+            if total > 1 else "Here's the best pick."
+        )
+    elif intro_mode == "long_weak":
+        intro_main = f"{total} videos to compare"
+        intro_sub = "Top match wasn't a strong fit — browse alternates with the arrows."
+    else:  # 'fallback'
+        intro_main = f"{total} video{'s' if total > 1 else ''} that might help"
+        intro_sub = (
+            "Showing the best match — tap the arrows to browse the others."
+            if total > 1 else "Showing the only match for this query."
+        )
+
+    st.markdown(
+        f'<div class="carousel-intro">'
+        f'<b>{intro_main}</b>'
+        f'<span class="carousel-sub">{intro_sub}</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    _render_video_card(current)
+
+    if total > 1:
+        _render_carousel_controls(idx, total)
+
+
+def render_treatment(result: dict) -> None:
+    intent = result.get("intent")
+    videos = result.get("videos", [])
+    text_answer = result.get("text_answer", "")
+
+    st.markdown('<div class="col-card col-card-treatment">', unsafe_allow_html=True)
+    st.markdown(
+        f'<p class="col-title col-label-treatment">'
+        f'<span class="col-dot col-dot-treatment"></span>TREATMENT · Visual Intent Detection '
+        f'&nbsp;{_intent_badge_html(intent)}</p>',
+        unsafe_allow_html=True,
+    )
+
+    # Intent failed
+    if not intent:
+        if text_answer:
+            st.markdown(text_answer)
+        st.markdown(
+            '<div class="err-banner"><span class="banner-icon">❌</span>'
+            '<div class="banner-text"><b>Intent classifier failed</b>'
+            'Cannot determine whether to show a video. See pipeline below.</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    # Text-only intent
+    if not intent.has_visual_intent or intent.format == "none":
+        if text_answer:
+            st.markdown(text_answer)
+        conf = f"{intent.confidence:.0%}"
+        st.markdown(
+            f'<div class="info-banner"><span class="banner-icon">💬</span>'
+            f'<div class="banner-text"><b>Text is the right medium</b>'
+            f'{intent.rationale} ({conf} confident)</div></div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    # No videos found
+    if not videos:
+        if text_answer:
+            st.markdown(text_answer)
+        st.markdown(
+            '<div class="warn-banner"><span class="banner-icon">⚠️</span>'
+            '<div class="banner-text"><b>No relevant video found</b>'
+            "Try rephrasing or adding 'how to'.</div></div>",
+            unsafe_allow_html=True,
+        )
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+
+    # ── Smart placement (text ↔ video order) ────────────────────────────────
+    # format == "short" (e.g. "tie a Windsor knot") → video is the answer; show
+    # it FIRST so the user doesn't scroll past walls of text.
+    # format == "long" (e.g. "how does GPS work") → text context first, video below.
+    video_first = (intent.format == "short")
+
+    # ── Smart exposure: how many videos do we expose? ──────────────────────
+    # short        → always 3, browsing is natural for quick visual clips
+    # long+strong  → just 1, AI is confident; alternatives would be noise
+    # long+weak    → 3, surface alternatives so user can recover from a bad #1
+    # (all 3 are still pre-computed in parallel — we just decide what to render)
+    verdict_1 = (
+        videos[0]["verif"].verdict
+        if videos[0].get("verif") is not None else None
+    )
+    if intent.format == "short":
+        videos_to_show = videos
+        intro_mode = "video_first"
+    elif verdict_1 == "strong_match":
+        videos_to_show = [videos[0]]
+        intro_mode = None  # signal: render single video, no carousel chrome
+    else:
+        videos_to_show = videos
+        intro_mode = "long_weak"
+
+    # Text answer ABOVE when text-first
+    if not video_first and text_answer:
+        st.markdown(text_answer)
+
+    if intro_mode is None:
+        # Confident long-form pick: just the video card, no intro, no controls.
+        # The verification badge itself ("Verified match · 95% confidence") IS
+        # the framing here.
+        _render_video_card(videos_to_show[0])
+    else:
+        _render_carousel_block(videos_to_show, intro_mode=intro_mode)
+
+    # Text answer BELOW when video-first
+    if video_first and text_answer:
+        st.markdown(
+            '<hr style="margin:18px 0 12px 0;border:none;'
+            'border-top:1px solid var(--g-border);">',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<p style="font-size:0.85rem;color:var(--g-text-3);font-weight:500;'
+            'margin:0 0 6px 0;">More detail in text</p>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(text_answer)
 
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -795,10 +944,30 @@ def _pcard(title: str, state: str, lines: list[str], detail: dict | None = None)
 def render_pipeline(result: dict) -> None:
     with st.expander("Agent pipeline", expanded=False):
         intent_d = result.get("visual_intent")
-        yt_d     = result.get("youtube")
-        ts_d     = result.get("timestamp")
-        verif_d  = result.get("verification_raw")
-        errors   = result.get("errors", {})
+        errors_global = dict(result.get("errors", {}))
+        videos = result.get("videos", [])
+        total = len(videos)
+
+        # Show diagnostic for the currently-displayed carousel video
+        idx = st.session_state.get("current_video_idx", 0)
+        idx = max(0, min(idx, total - 1)) if total else 0
+        current = videos[idx] if total else None
+
+        yt_d    = current["yt"].model_dump() if current and current.get("yt") else None
+        ts_d    = current["ts"].model_dump() if current and current.get("ts") else None
+        verif_d = current["verif"].model_dump() if current and current.get("verif") else None
+        errors  = dict(errors_global)
+        if current:
+            errors.update(current.get("errors", {}))
+
+        if total > 1:
+            st.markdown(
+                f'<p style="font-size:0.84rem;color:var(--g-text-2);margin:0 0 8px 0;">'
+                f'Showing pipeline for <b>video {idx + 1} of {total}</b> — '
+                f'switch via the carousel arrows above to inspect each one.'
+                f'</p>',
+                unsafe_allow_html=True,
+            )
 
         # 4-card pipeline: intent → youtube → timestamp → verification
         c1, a1, c2, a2, c3, a3, c4 = st.columns([3, 0.4, 3, 0.4, 3, 0.4, 3])
@@ -859,7 +1028,7 @@ def render_pipeline(result: dict) -> None:
                 _pcard("Timestamp Picker", "error",
                        [f'<code>{str(errors["timestamp"])[:100]}</code>'])
             else:
-                _pcard("Timestamp Picker", "inactive", ["Short-form or text — not needed."])
+                _pcard("Timestamp Picker", "inactive", ["Video ≤ 20s or text-only — not needed."])
 
         with a3:
             st.markdown(arrow, unsafe_allow_html=True)
@@ -907,60 +1076,225 @@ def render_pipeline(result: dict) -> None:
 # HOW IT WORKS
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# SESSION LOG (for professor / grader review)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _append_session_log(query: str, trace: dict) -> None:
+    """Build a structured log entry from a completed pipeline trace and append
+    to st.session_state['session_log']. Runs AFTER run_pipeline returns — zero
+    impact on pipeline latency. Captures: query, total time, intent decision,
+    per-video metadata + verdict + timestamp, and any errors.
+    """
+    intent_obj = trace.get("intent")
+    videos = trace.get("videos", [])
+
+    # Format timestamp in the viewer's local timezone (falls back to LA)
+    try:
+        tz = ZoneInfo(st.context.timezone)
+    except Exception:
+        tz = ZoneInfo("America/Los_Angeles")
+
+    entry = {
+        "timestamp": datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "query": query,
+        "total_ms": trace.get("timings_ms", {}).get("total", 0),
+        "intent": {
+            "format": intent_obj.format,
+            "confidence": round(intent_obj.confidence, 3),
+            "has_visual_intent": intent_obj.has_visual_intent,
+            "rationale": intent_obj.rationale,
+        } if intent_obj else None,
+        "videos": [
+            {
+                "rank": i + 1,
+                "title": v["yt"].title,
+                "channel": v["yt"].channel,
+                "views": v["yt"].views,
+                "duration_secs": v["yt"].duration_secs,
+                "video_url": v["yt"].video_url,
+                "search_query_used": v["yt"].search_query_used,
+                "verdict": v["verif"].verdict if v.get("verif") else None,
+                "verdict_confidence": round(v["verif"].confidence, 3) if v.get("verif") else None,
+                "verdict_explanation": v["verif"].explanation if v.get("verif") else None,
+                "timestamp_picked": (
+                    {"start": v["ts"].start_seconds, "end": v["ts"].end_seconds}
+                    if v.get("ts") else None
+                ),
+                "timestamp_corrected": v.get("timestamp_corrected", False),
+                "errors": list(v.get("errors", {}).keys()),
+            }
+            for i, v in enumerate(videos)
+        ],
+        "global_errors": list(trace.get("errors", {}).keys()),
+    }
+    st.session_state.setdefault("session_log", []).append(entry)
+
+
+def _render_log_entry(entry: dict) -> None:
+    intent = entry.get("intent")
+    intent_str = (
+        f"`{intent['format']}` ({intent['confidence']:.0%})"
+        if intent else "intent failed"
+    )
+    videos = entry.get("videos", [])
+
+    st.markdown(
+        f"**`{entry['timestamp']}`** &nbsp;·&nbsp; *“{entry['query']}”*  \n"
+        f"&nbsp;&nbsp;**{entry['total_ms']/1000:.1f}s** &nbsp;·&nbsp; "
+        f"intent: {intent_str} &nbsp;·&nbsp; "
+        f"{len(videos)} video{'s' if len(videos) != 1 else ''}"
+    )
+
+    if entry.get("global_errors"):
+        st.markdown(
+            f"&nbsp;&nbsp;❌ **Pipeline errors:** {', '.join(entry['global_errors'])}"
+        )
+
+    verdict_emoji = {
+        "strong_match":  "✅",
+        "partial_match": "⚠️",
+        "poor_match":    "❌",
+    }
+    for v in videos:
+        emoji = verdict_emoji.get(v.get("verdict"), "—")
+        conf = v.get("verdict_confidence")
+        conf_str = f" {conf:.0%}" if conf is not None else ""
+        ts_str = ""
+        if v.get("timestamp_picked"):
+            tp = v["timestamp_picked"]
+            ts_str = f" · clip {tp['start']}s→{tp['end']}s"
+        if v.get("timestamp_corrected"):
+            ts_str += " (corrected by verification)"
+        err_str = f" · errors: {', '.join(v['errors'])}" if v.get("errors") else ""
+        title = v["title"][:60] + ("…" if len(v["title"]) > 60 else "")
+        st.markdown(
+            f"&nbsp;&nbsp;{emoji} **#{v['rank']}** {title} "
+            f"&nbsp;·&nbsp; *{v['channel']}*{conf_str}{ts_str}{err_str}"
+        )
+
+
+def render_session_log() -> None:
+    """Bottom-of-page expander that shows every query run this session and how
+    each agent performed. Designed for the professor / grader to inspect the
+    multi-agent system end-to-end. Downloadable as JSON for permanent record."""
+    log = st.session_state.get("session_log", [])
+    if not log:
+        return
+
+    label = (
+        f"📋 Session log — {len(log)} "
+        f"{'query' if len(log) == 1 else 'queries'} so far"
+    )
+    with st.expander(label, expanded=False):
+        st.caption(
+            "Per-query trace of what each agent (Intent Classifier · YouTube "
+            "Search · Timestamp Picker · Verification) decided. Most recent "
+            "first. Persists for this browser session only — download as JSON "
+            "for a permanent record."
+        )
+
+        log_json = json.dumps(log, indent=2, default=str)
+        ts_slug = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.download_button(
+            label="⬇ Download log (JSON)",
+            data=log_json,
+            file_name=f"videosense_log_{ts_slug}.json",
+            mime="application/json",
+            key="dl_session_log",
+        )
+        st.markdown("---")
+
+        for entry in reversed(log):  # newest first
+            _render_log_entry(entry)
+            st.markdown("---")
+
+
 def render_how_it_works() -> None:
     with st.expander("How this prototype works", expanded=False):
         st.markdown("### Five-agent pipeline")
 
         col1, col2 = st.columns(2)
         with col1:
-            st.markdown("**APIs used**")
+            st.markdown("**Models & APIs**")
             st.markdown(
-                "- **Gemini** (`gemini-2.5-flash`) — Intent Classifier, "
-                "Timestamp Picker, Verification Agent, text answers, search query optimizer\n"
-                "- **YouTube Data API v3** — search.list + videos.list for metadata"
+                "- **Gemini** (`gemini-3.1-flash-lite`) — powers the Text Answer, "
+                "Intent Classifier, Timestamp Picker, Verification Agent, and the "
+                "conditional LLM rewrite inside YouTube Search.\n"
+                "- **YouTube Data API v3** — `search.list` + `videos.list` for "
+                "candidate retrieval and video metadata."
             )
         with col2:
             st.markdown("**Parallelism**")
             st.markdown(
-                "Text answer + Intent Classifier run in parallel (ThreadPoolExecutor). "
-                "YouTube, Timestamp, and Verification run sequentially. "
-                "Total latency: typically 4–14 s depending on video length."
+                "Text Answer + Intent Classifier run in parallel. YouTube Search "
+                "returns the **top 3 candidates** ranked by view-count × short-form "
+                "boost, then Timestamp Picker + Verification run for **all 3 videos "
+                "in parallel** via `ThreadPoolExecutor`. This is ~3× the API cost "
+                "but the same wall-clock latency as processing one — the user can "
+                "then flip through the carousel locally without triggering new calls."
             )
 
         st.markdown("### Decision tree")
         st.code(
             "Query submitted\n"
-            "├─ [parallel] Text answer + Intent Classifier\n"
+            "├─ [parallel] Text Answer  +  Intent Classifier\n"
             "│\n"
-            "├─ has_visual_intent = False → text only in both columns\n"
+            "├─ has_visual_intent = False  →  text answer only on both columns\n"
             "└─ has_visual_intent = True\n"
-            "    └─ YouTube Search\n"
-            "        ├─ No results → fallback: text + warning banner\n"
-            "        └─ Video found\n"
-            "            ├─ duration ≤ 60s → embed from 0:00\n"
-            "            └─ duration > 60s → Timestamp Picker\n"
-            "                ├─ Valid range → embed at start→end\n"
-            "                └─ Invalid → embed from 0:00 (safe fallback)\n"
-            "            └─ [always] Verification Agent → trust badge",
+            "    └─ YouTube Search  (raw query for ≤10 words; LLM rewrite for >10)\n"
+            "        ├─ No results  →  warning banner; no embed\n"
+            "        └─ Top 3 videos found  →  parallel per-video pipeline:\n"
+            "            ├─ duration ≤ 20s  →  embed from 0:00 (skip Timestamp Picker)\n"
+            "            └─ duration > 20s  →  Timestamp Picker\n"
+            "                                  ├─ Valid range  →  embed at start→end\n"
+            "                                  └─ Invalid      →  embed from 0:00\n"
+            "            └─ [always] Verification Agent\n"
+            "                ├─ Video relevance  →  strong / partial / poor match badge\n"
+            "                └─ Timestamp accuracy  →  can override Picker's start_seconds\n"
+            "    └─ Carousel: arrow buttons flip between the 3 fully-analysed videos\n"
+            "                 (instant — no new API calls; idx tracked in session_state)",
             language="text",
         )
 
-        st.markdown("### Verification Agent (new)")
+        st.markdown("### Verification Agent")
         st.markdown(
-            "After a video is found, a separate Gemini call independently checks "
-            "whether the title and metadata actually match the user's query. "
-            "It returns a verdict (`strong_match`, `partial_match`, `poor_match`) "
-            "and confidence score, surfaced as a coloured strip above the video embed. "
-            "A `poor_match` verdict does not suppress the video — it acts as a "
-            "transparent trust signal for the user."
+            "After a video is found, a separate Gemini call **watches the actual "
+            "video** (via `Part.from_uri` / `file_data` ingestion — the same "
+            "capability the Timestamp Picker uses, not just title/metadata) and "
+            "judges two things independently:\n\n"
+            "1. **Video relevance** — does this video genuinely answer the query? "
+            "Returns a verdict (`strong_match` / `partial_match` / `poor_match`) "
+            "and confidence score, surfaced as a coloured strip above the embed.\n"
+            "2. **Timestamp accuracy** — does the Picker's proposed clip actually "
+            "point to the right moment? If not, the agent returns "
+            "`corrected_start_seconds` and the pipeline overrides the Picker's "
+            "choice with the verification agent's correction (visible in the UI "
+            "as a 🔧 'Corrected start' notice).\n\n"
+            "A `poor_match` verdict does **not** suppress the video — by design, "
+            "it surfaces as a transparent trust signal so the user can judge "
+            "for themselves rather than having results silently hidden."
+        )
+
+        st.markdown("### Search-query optimization")
+        st.markdown(
+            "For typical queries (**≤10 words**), the raw user query is sent to "
+            "YouTube verbatim with a `shorts` / `tutorial` suffix appended — no "
+            "LLM call, no risk of over-compression. Only **long, conversational "
+            "queries (>10 words)** go through an LLM rewrite step, and even then "
+            "with temperature `0.2` for obedience and a validation guard that "
+            "falls back to the raw query if the rewrite degenerates to fewer "
+            "than 3 words. This was hardened after an earlier failure where the "
+            "optimizer compressed *'How do I tie a Windsor knot'* to *'Wind'*, "
+            "which YouTube happily matched against the Naruto ending song."
         )
 
         st.markdown("### Error and fallback states")
         st.markdown(
             "| Failure | Fallback |\n"
             "|---|---|\n"
-            "| Gemini overloaded (503) | Retries ×3 with exponential backoff (2s → 4s → 8s) |\n"
-            "| Intent classifier fails | Treatment shows text only; error banner shown |\n"
+            "| Gemini overloaded (503) | Retries ×3 with exponential backoff (2s, 4s between attempts) |\n"
+            "| Intent classifier fails | Treatment column shows text answer + error banner |\n"
             "| YouTube API error | Error banner with diagnosis; text answer still shown |\n"
             "| No video results | Warning banner; no embed |\n"
             "| Timestamp out of range | Plays from 0:00; warning shown in pipeline |\n"
@@ -972,8 +1306,65 @@ def render_how_it_works() -> None:
 # PIPELINE RUNNER
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _process_one_video(query: str, yt) -> dict:
+    """Run Timestamp Picker + Verification for ONE candidate video.
+
+    Returns a per-video dict containing the YouTube result, the (possibly
+    verification-corrected) timestamp, the verification result, any errors,
+    and bookkeeping fields. Safe to call in parallel — each call is independent
+    and only touches its own dict.
+    """
+    video = {
+        "yt": yt,
+        "ts": None,
+        "verif": None,
+        "errors": {},
+        "timestamp_corrected": False,
+        "timestamp_original_start": 0,
+    }
+
+    # Timestamp Picker — only for videos >20s; shorter clips just play from 0:00.
+    if yt.duration_secs > 20:
+        try:
+            ts = agents.find_timestamp(query, yt.video_url)
+            if 0 <= ts.start_seconds < ts.end_seconds:
+                video["ts"] = ts
+            else:
+                video["errors"]["timestamp"] = "invalid range — playing from start"
+        except Exception as e:
+            video["errors"]["timestamp"] = repr(e)
+
+    # Verification — always runs once we have a video, regardless of timestamp.
+    try:
+        verif = agents.verify_video_match(query, yt, video["ts"])
+        video["verif"] = verif
+
+        # Apply timestamp correction if verification disagrees with Picker.
+        if (
+            not verif.timestamp_is_correct
+            and verif.corrected_start_seconds is not None
+            and verif.corrected_start_seconds >= 0
+        ):
+            ts = video["ts"]
+            original_start = ts.start_seconds if ts else 0
+            corrected = verif.corrected_start_seconds
+            original_end = ts.end_seconds if ts else (corrected + 90)
+            new_end = max(original_end, corrected + 30)
+            video["ts"] = agents.TimestampPick(
+                start_seconds=corrected,
+                end_seconds=new_end,
+                reasoning=verif.timestamp_explanation,
+            )
+            video["timestamp_corrected"] = True
+            video["timestamp_original_start"] = original_start
+    except Exception as e:
+        video["errors"]["verification"] = repr(e)
+
+    return video
+
+
 def run_pipeline(query: str) -> dict:
-    trace: dict = {"query": query, "errors": {}, "timings_ms": {}}
+    trace: dict = {"query": query, "errors": {}, "timings_ms": {}, "videos": []}
     t0 = time.perf_counter()
 
     shimmer = st.empty()
@@ -988,7 +1379,7 @@ def run_pipeline(query: str) -> dict:
 
     with st.status("Running VideoSense agents…", expanded=True) as status:
 
-        # Step 1 — parallel
+        # Step 1 — parallel: text answer + intent classifier
         st.write("🔍 Running Intent Classifier and generating text answer…")
         with ThreadPoolExecutor(max_workers=2) as pool:
             tf = pool.submit(agents.generate_text_answer, query)
@@ -1016,108 +1407,54 @@ def run_pipeline(query: str) -> dict:
         else:
             st.write("❌ Intent Classifier failed — see pipeline for details")
 
-        # Step 2 — YouTube
-        yt = None
-        ts = None
-        verif = None
-
+        # Step 2 — YouTube Search: fetch top 3 candidates
+        videos: list[dict] = []
         if intent and intent.has_visual_intent and intent.format in ("short", "long"):
-            kind = "Short" if intent.format == "short" else "video"
-            st.write(f"🎬 Searching YouTube for the best {kind}…")
+            kind = "Shorts" if intent.format == "short" else "videos"
+            st.write(f"🎬 Searching YouTube for the top 3 {kind}…")
             try:
-                yt = agents.find_youtube_video(query, intent.format)
-                trace["youtube"] = yt.model_dump() if yt else None
-                if yt:
-                    st.write(f"✅ Found **{yt.title}** by {yt.channel} ({fmt_n(yt.views)} views)")
+                yts = agents.find_youtube_videos(query, intent.format, n=3)
+                if yts:
+                    titles = ", ".join(f"_{y.title[:35]}_" for y in yts[:3])
+                    st.write(f"✅ Found {len(yts)} candidate{'s' if len(yts) > 1 else ''}: {titles}")
                 else:
-                    st.write("⚠️ No relevant video found — try rephrasing")
+                    st.write("⚠️ No relevant videos found — try rephrasing")
             except Exception as e:
                 trace["errors"]["youtube"] = repr(e)
+                yts = []
                 st.write("❌ YouTube Search failed — check pipeline for details")
 
-            # Step 3 — Timestamp (run for all videos over 20 s — even short-form
-            # clips can have intros worth skipping; only true <20 s clips are exempt)
-            if yt and yt.duration_secs > 20:
-                st.write("⏱️ Reading video to find the exact relevant moment…")
-                try:
-                    ts = agents.find_timestamp(query, yt.video_url)
-                    trace["timestamp"] = ts.model_dump()
-                    if 0 <= ts.start_seconds < ts.end_seconds:
-                        st.write(
-                            f"✅ Timestamp: **{fmt_ts(ts.start_seconds)}** → "
-                            f"**{fmt_ts(ts.end_seconds)}** — _{ts.reasoning}_"
-                        )
-                    else:
-                        trace["errors"]["timestamp"] = "invalid range — playing from start"
-                        ts = None
-                        st.write("⚠️ Timestamp out of range — playing from start")
-                except Exception as e:
-                    trace["errors"]["timestamp"] = repr(e)
-                    ts = None
-                    st.write("⚠️ Timestamp Picker failed — playing from start")
+            # Step 3 — parallel: Timestamp Picker + Verification for EACH video.
+            # Wall-clock latency stays roughly the same as processing one video
+            # (limited by the slowest), but the API cost scales 3×. The carousel
+            # lets the user flip between fully-analysed alternatives instantly.
+            if yts:
+                st.write(
+                    f"⏱️🔎 Analyzing all {len(yts)} videos in parallel "
+                    "(Timestamp Picker + Verification per video)…"
+                )
+                with ThreadPoolExecutor(max_workers=len(yts)) as pool:
+                    futures = [pool.submit(_process_one_video, query, yt) for yt in yts]
+                    videos = [f.result() for f in futures]
 
-            # Step 4 — Verification: watches the video at the proposed timestamp
-            # and cross-checks both video relevance AND timestamp accuracy.
-            # If it finds a better start second, that overrides the picker's answer.
-            if yt:
-                st.write("🔎 Verifying video and timestamp accuracy…")
-                try:
-                    verif = agents.verify_video_match(query, yt, ts)
-                    trace["verification_raw"] = verif.model_dump()
-
-                    verdict_labels = {
-                        "strong_match": "✅ Strong match",
-                        "partial_match": "⚠️ Partial match",
-                        "poor_match": "❌ Poor match",
-                    }
-                    ts_icon = "✅" if verif.timestamp_is_correct else "🔧"
-                    st.write(
-                        f"{verdict_labels.get(verif.verdict, verif.verdict)} "
-                        f"({verif.confidence:.0%}) — _{verif.explanation}_"
-                    )
-                    st.write(
-                        f"{ts_icon} Timestamp check: _{verif.timestamp_explanation}_"
-                    )
-
-                    # Override timestamp with agent's correction if it disagrees
-                    if (
-                        not verif.timestamp_is_correct
-                        and verif.corrected_start_seconds is not None
-                        and verif.corrected_start_seconds >= 0
-                    ):
-                        original_start = ts.start_seconds if ts else 0
-                        corrected = verif.corrected_start_seconds
-                        # Preserve original end if we have one; otherwise add 90s window
-                        original_end = ts.end_seconds if ts else (corrected + 90)
-                        new_end = max(original_end, corrected + 30)
-                        ts = agents.TimestampPick(
-                            start_seconds=corrected,
-                            end_seconds=new_end,
-                            reasoning=verif.timestamp_explanation,
-                        )
-                        trace["timestamp"] = ts.model_dump()
-                        trace["timestamp_corrected"] = True
-                        trace["timestamp_original_start"] = original_start
-                        st.write(
-                            f"🔧 Corrected start: **{fmt_ts(original_start)}** → "
-                            f"**{fmt_ts(corrected)}** based on verification"
-                        )
-
-                except Exception as e:
-                    trace["errors"]["verification"] = repr(e)
-                    verif = None
-                    st.write("⚠️ Verification Agent failed — video shown with original timestamp")
+                # Summarise per-video verdicts in the status log
+                vmap = {"strong_match": "✅", "partial_match": "⚠️", "poor_match": "❌"}
+                verdicts = [
+                    vmap.get(v["verif"].verdict, "—") if v.get("verif") else "—"
+                    for v in videos
+                ]
+                st.write(
+                    "✅ Per-video verdicts: "
+                    + "   ".join(f"#{i+1} {v}" for i, v in enumerate(verdicts))
+                )
         else:
             if intent:
                 st.write("💬 Text-only query — no video needed")
 
+        trace["videos"] = videos
+        trace["intent"] = intent
         trace["timings_ms"]["total"] = round((time.perf_counter() - t0) * 1000)
-        trace.update({
-            "youtube_result": yt,
-            "timestamp_pick": ts,
-            "intent": intent,
-            "verification": verif,
-        })
+
         status.update(
             label=f"✓ Done in {trace['timings_ms']['total']} ms",
             state="complete",
@@ -1151,17 +1488,23 @@ def main() -> None:
         elif not os.environ.get("YOUTUBE_API_KEY"):
             st.error("❌ YOUTUBE_API_KEY is not set. Add it to `.streamlit/secrets.toml`.")
         else:
+            # Reset carousel position before running pipeline — the new query may
+            # have fewer videos than the previous one, and we always want to start
+            # on the highest-ranked match anyway.
+            st.session_state.current_video_idx = 0
             result = run_pipeline(query)
             st.session_state.last_result = result
-            # History
+            # Sidebar history (lightweight summary, last 5 queries)
             st.session_state.history = (
                 [{
                     "query": query,
-                    "had_video": result.get("youtube_result") is not None,
+                    "had_video": bool(result.get("videos")),
                     "intent": result["intent"].format if result.get("intent") else "error",
                 }]
-                + st.session_state.history
+                + st.session_state.get("history", [])
             )[:5]
+            # Full session log (every query, full per-agent trace — for grader review)
+            _append_session_log(query, result)
 
     # Render last result
     if st.session_state.last_result:
@@ -1177,6 +1520,7 @@ def main() -> None:
         render_pipeline(result)
 
     st.divider()
+    render_session_log()
     render_how_it_works()
 
     st.markdown(
