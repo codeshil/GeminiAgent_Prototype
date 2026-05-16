@@ -95,14 +95,23 @@ def _iso_to_secs(duration: str) -> int:
 def generate_text_answer(query: str) -> str:
     client = _get_client()
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.1-flash-lite",
         contents=query,
         config=types.GenerateContentConfig(
             system_instruction=(
-                "You are a helpful, concise assistant. Answer the user's query in "
-                "2–4 sentences. Be factual and clear. Do not suggest looking for a video."
+                "You are Gemini, Google's AI assistant. Answer the user's query "
+                "thoroughly and clearly, formatted the way Gemini answers in the "
+                "consumer app: use ## headings to organize sections when useful, "
+                "**bold** for key terms, numbered lists for step-by-step "
+                "instructions, bulleted lists for parallel items, and short "
+                "explanatory paragraphs. Include a 'Pro Tip:' line when there is "
+                "a useful nuance worth flagging. Do not suggest looking for a "
+                "video — give the complete answer in text."
             ),
-            max_output_tokens=350,
+            # Generous budget — thinking tokens AND visible response tokens share
+            # the output budget on Gemini 2.5/3 family models. 3000 leaves comfortable
+            # room for thinking + a full structured answer with sections and lists.
+            max_output_tokens=3000,
         ),
     )
     return response.text or ""
@@ -144,7 +153,7 @@ def classify_visual_intent(query: str) -> VisualIntent:
         "confidence (0–1), rationale (one sentence)."
     )
     resp = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.1-flash-lite",
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
@@ -181,7 +190,7 @@ def _optimize_query(query: str, fmt: str) -> str:
     try:
         client = _get_client()
         resp = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.1-flash-lite",
             contents=(
                 f'Summarize this question into a 4–7 word YouTube search query. '
                 f'Keep all important nouns. Append "{suffix}". '
@@ -202,7 +211,13 @@ def _optimize_query(query: str, fmt: str) -> str:
 
 
 @_retry()
-def find_youtube_video(query: str, fmt: str) -> Optional[YouTubeResult]:
+def find_youtube_videos(query: str, fmt: str, n: int = 3) -> list[YouTubeResult]:
+    """Fetch top-N candidate videos for the query, sorted by score (best first).
+
+    Score = views × (3 if format is short and video is short, else 1) — pure
+    view-count weighted with a short-form boost. The carousel UI consumes this
+    list; the legacy `find_youtube_video` below wraps this for the n=1 case.
+    """
     yt_key = os.environ.get("YOUTUBE_API_KEY")
     if not yt_key:
         raise ValueError("YOUTUBE_API_KEY environment variable is not set.")
@@ -210,7 +225,7 @@ def find_youtube_video(query: str, fmt: str) -> Optional[YouTubeResult]:
     search_q = _optimize_query(query, fmt)
     dur_filter = "short" if fmt == "short" else "any"
 
-    # Search
+    # Search — YouTube returns up to 5 candidates ranked by its own relevance.
     search = requests.get(
         "https://www.googleapis.com/youtube/v3/search",
         params={
@@ -227,9 +242,9 @@ def find_youtube_video(query: str, fmt: str) -> Optional[YouTubeResult]:
     search.raise_for_status()
     items = search.json().get("items", [])
     if not items:
-        return None
+        return []
 
-    # Fetch stats + duration
+    # Fetch stats + duration for all candidates in one batch call.
     ids = [it["id"]["videoId"] for it in items]
     stats_resp = requests.get(
         "https://www.googleapis.com/youtube/v3/videos",
@@ -243,9 +258,8 @@ def find_youtube_video(query: str, fmt: str) -> Optional[YouTubeResult]:
     stats_resp.raise_for_status()
     stats_map = {it["id"]: it for it in stats_resp.json().get("items", [])}
 
-    best: Optional[YouTubeResult] = None
-    best_score = -1
-
+    # Score every candidate, keep the top N (by score, descending).
+    scored: list[tuple[int, YouTubeResult]] = []
     for item in items:
         vid_id = item["id"]["videoId"]
         if vid_id not in stats_map:
@@ -256,23 +270,31 @@ def find_youtube_video(query: str, fmt: str) -> Optional[YouTubeResult]:
         likes = int(likes_raw) if likes_raw else None
         dur = _iso_to_secs(st["contentDetails"]["duration"])
         is_short = dur <= 90
-
         score = views * (3 if fmt == "short" and is_short else 1)
-        if score > best_score:
-            best_score = score
-            best = YouTubeResult(
-                video_id=vid_id,
-                video_url=f"https://www.youtube.com/watch?v={vid_id}",
-                title=item["snippet"]["title"],
-                channel=item["snippet"]["channelTitle"],
-                views=views,
-                likes=likes,
-                duration_secs=dur,
-                is_short=is_short,
-                search_query_used=search_q,
-            )
+        scored.append((score, YouTubeResult(
+            video_id=vid_id,
+            video_url=f"https://www.youtube.com/watch?v={vid_id}",
+            title=item["snippet"]["title"],
+            channel=item["snippet"]["channelTitle"],
+            views=views,
+            likes=likes,
+            duration_secs=dur,
+            is_short=is_short,
+            search_query_used=search_q,
+        )))
 
-    return best
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [r for _, r in scored[:n]]
+
+
+def find_youtube_video(query: str, fmt: str) -> Optional[YouTubeResult]:
+    """Backward-compat wrapper: returns just the top-scored video, or None.
+
+    Used by the Control column's keyword-triggered embed. The main pipeline
+    calls `find_youtube_videos` directly to populate the carousel.
+    """
+    videos = find_youtube_videos(query, fmt, n=1)
+    return videos[0] if videos else None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -294,9 +316,16 @@ def find_timestamp(query: str, video_url: str) -> TimestampPick:
         f"Return start_seconds, end_seconds, and a one-sentence reasoning."
     )
     resp = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.1-flash-lite",
         contents=[
-            types.Part(file_data=types.FileData(file_uri=video_url)),
+            types.Part(
+                file_data=types.FileData(file_uri=video_url),
+                # Cap ingestion at the first 10 minutes. Without this, Gemini
+                # processes the full video — the dominant latency cost for long
+                # ones. The prompt's "first 10 min only" wording does nothing on
+                # its own; this is the API-level enforcement.
+                video_metadata=types.VideoMetadata(end_offset="600s"),
+            ),
             prompt,
         ],
         config=types.GenerateContentConfig(
@@ -391,11 +420,15 @@ Return JSON:
   timestamp_explanation   : one sentence on whether the timestamp points to the right moment
   corrected_start_seconds : int or null
 """
-    # Watch the actual video — same capability used by the timestamp picker
+    # Watch the actual video — same capability used by the timestamp picker.
+    # Cap at first 10 minutes (see find_timestamp for rationale).
     resp = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.1-flash-lite",
         contents=[
-            types.Part(file_data=types.FileData(file_uri=yt.video_url)),
+            types.Part(
+                file_data=types.FileData(file_uri=yt.video_url),
+                video_metadata=types.VideoMetadata(end_offset="600s"),
+            ),
             prompt,
         ],
         config=types.GenerateContentConfig(
