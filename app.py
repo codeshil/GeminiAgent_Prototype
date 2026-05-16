@@ -356,8 +356,6 @@ EXAMPLES = [
     ("🔧 Clean car undercarriage", "how to clean the undercarriage of a car"),
     ("💬 What causes inflation", "what causes inflation"),
     ("🏋️ Deadlift form", "how to deadlift with proper form"),
-    ("🪴 Repot a plant", "how to repot a houseplant"),
-    ("📡 How GPS works", "how does GPS know where you are"),
 ]
 
 
@@ -370,7 +368,6 @@ def _init() -> None:
         "last_result": None,
         "history": [],
         "current_video_idx": 0,    # which video the carousel is showing
-        "session_log": [],         # full per-query agent trace (for professor review)
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -692,11 +689,17 @@ def _intent_badge_html(intent) -> str:
     return badge("▶ long video + timestamp", "blue")
 
 
-def _render_carousel_controls(idx: int, total: int) -> None:
-    """Prev/next arrows + 'Video X of Y' counter + dot indicators."""
+def _render_carousel_controls(idx: int, total: int, key_prefix: str = "carousel") -> None:
+    """Prev/next arrows + 'Video X of Y' counter + dot indicators.
+
+    key_prefix scopes the button keys so the carousel can be rendered in
+    multiple places in the same script run (e.g. inside both the main tab
+    and the compare tab) without Streamlit key collisions. Both instances
+    still share st.session_state.current_video_idx so the state stays in sync.
+    """
     col_l, col_c, col_r = st.columns([1, 4, 1])
     with col_l:
-        if st.button("◀", key="carousel_prev",
+        if st.button("◀", key=f"{key_prefix}_prev",
                      disabled=(idx == 0), use_container_width=True):
             st.session_state.current_video_idx = max(0, idx - 1)
             st.rerun()
@@ -711,7 +714,7 @@ def _render_carousel_controls(idx: int, total: int) -> None:
             unsafe_allow_html=True,
         )
     with col_r:
-        if st.button("▶", key="carousel_next",
+        if st.button("▶", key=f"{key_prefix}_next",
                      disabled=(idx == total - 1), use_container_width=True):
             st.session_state.current_video_idx = min(total - 1, idx + 1)
             st.rerun()
@@ -772,13 +775,16 @@ def _render_video_card(current: dict) -> None:
         st.video(yt.video_url)
 
 
-def _render_carousel_block(videos: list, intro_mode: str) -> None:
+def _render_carousel_block(videos: list, intro_mode: str, key_prefix: str = "carousel") -> None:
     """Render the carousel: intro + current video card + arrow controls.
 
     intro_mode:
       - 'video_first' → short-form, "Best answered with a video" framing
       - 'long_weak'   → long-form with weak top match, "alternates" framing
       - 'fallback'    → generic framing for other cases
+
+    key_prefix is forwarded to the arrow buttons so this block can be rendered
+    in multiple places (e.g. main tab + compare tab) without key collisions.
     """
     total = len(videos)
     idx = st.session_state.get("current_video_idx", 0)
@@ -812,21 +818,30 @@ def _render_carousel_block(videos: list, intro_mode: str) -> None:
     _render_video_card(current)
 
     if total > 1:
-        _render_carousel_controls(idx, total)
+        _render_carousel_controls(idx, total, key_prefix=key_prefix)
 
 
-def render_treatment(result: dict) -> None:
+def render_treatment(result: dict, solo: bool = False) -> None:
+    """Render the Treatment view (the new VideoSense feature).
+
+    solo=False (default): wrapped in a col-card with "TREATMENT · Visual Intent
+        Detection" column header. Used for the side-by-side comparison tab.
+    solo=True: bare content, no card chrome, no column header. Used as the
+        main "VideoSense" tab where this view stands alone as THE answer —
+        mimicking a real consumer-Gemini surface.
+    """
     intent = result.get("intent")
     videos = result.get("videos", [])
     text_answer = result.get("text_answer", "")
 
-    st.markdown('<div class="col-card col-card-treatment">', unsafe_allow_html=True)
-    st.markdown(
-        f'<p class="col-title col-label-treatment">'
-        f'<span class="col-dot col-dot-treatment"></span>TREATMENT · Visual Intent Detection '
-        f'&nbsp;{_intent_badge_html(intent)}</p>',
-        unsafe_allow_html=True,
-    )
+    if not solo:
+        st.markdown('<div class="col-card col-card-treatment">', unsafe_allow_html=True)
+        st.markdown(
+            f'<p class="col-title col-label-treatment">'
+            f'<span class="col-dot col-dot-treatment"></span>TREATMENT · Visual Intent Detection '
+            f'&nbsp;{_intent_badge_html(intent)}</p>',
+            unsafe_allow_html=True,
+        )
 
     # Intent failed
     if not intent:
@@ -838,7 +853,8 @@ def render_treatment(result: dict) -> None:
             'Cannot determine whether to show a video. See pipeline below.</div></div>',
             unsafe_allow_html=True,
         )
-        st.markdown('</div>', unsafe_allow_html=True)
+        if not solo:
+            st.markdown('</div>', unsafe_allow_html=True)
         return
 
     # Text-only intent
@@ -852,7 +868,8 @@ def render_treatment(result: dict) -> None:
             f'{intent.rationale} ({conf} confident)</div></div>',
             unsafe_allow_html=True,
         )
-        st.markdown('</div>', unsafe_allow_html=True)
+        if not solo:
+            st.markdown('</div>', unsafe_allow_html=True)
         return
 
     # No videos found
@@ -865,7 +882,8 @@ def render_treatment(result: dict) -> None:
             "Try rephrasing or adding 'how to'.</div></div>",
             unsafe_allow_html=True,
         )
-        st.markdown('</div>', unsafe_allow_html=True)
+        if not solo:
+            st.markdown('</div>', unsafe_allow_html=True)
         return
 
     # ── Smart placement (text ↔ video order) ────────────────────────────────
@@ -897,13 +915,17 @@ def render_treatment(result: dict) -> None:
     if not video_first and text_answer:
         st.markdown(text_answer)
 
+    # Scope widget keys so render_treatment can run twice in the same script
+    # (once per tab) without Streamlit complaining about duplicate keys.
+    key_prefix = "carousel_solo" if solo else "carousel_compare"
+
     if intro_mode is None:
         # Confident long-form pick: just the video card, no intro, no controls.
         # The verification badge itself ("Verified match · 95% confidence") IS
         # the framing here.
         _render_video_card(videos_to_show[0])
     else:
-        _render_carousel_block(videos_to_show, intro_mode=intro_mode)
+        _render_carousel_block(videos_to_show, intro_mode=intro_mode, key_prefix=key_prefix)
 
     # Text answer BELOW when video-first
     if video_first and text_answer:
@@ -919,7 +941,8 @@ def render_treatment(result: dict) -> None:
         )
         st.markdown(text_answer)
 
-    st.markdown('</div>', unsafe_allow_html=True)
+    if not solo:
+        st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -962,18 +985,38 @@ def render_pipeline(result: dict) -> None:
 
         if total > 1:
             st.markdown(
-                f'<p style="font-size:0.84rem;color:var(--g-text-2);margin:0 0 8px 0;">'
+                f'<p style="font-size:0.84rem;color:var(--g-text-2);margin:0 0 4px 0;">'
                 f'Showing pipeline for <b>video {idx + 1} of {total}</b> — '
                 f'switch via the carousel arrows above to inspect each one.'
                 f'</p>',
                 unsafe_allow_html=True,
             )
+        st.markdown(
+            '<p style="font-size:0.82rem;color:var(--g-text-3);margin:0 0 10px 0;">'
+            'Step 1 (Text Answer + Intent Classifier) runs in parallel; the rest is sequential.'
+            '</p>',
+            unsafe_allow_html=True,
+        )
 
-        # 4-card pipeline: intent → youtube → timestamp → verification
+        # 5-agent pipeline: [Text Answer ‖ Intent Classifier] → YouTube → Timestamp → Verification
+        # (column 1 stacks the two parallel agents; columns 2–4 are sequential)
         c1, a1, c2, a2, c3, a3, c4 = st.columns([3, 0.4, 3, 0.4, 3, 0.4, 3])
         arrow = '<div class="pipe-arrow">→</div>'
 
         with c1:
+            # Step 1a — Text Answer (parallel with Intent Classifier below)
+            text_answer = result.get("text_answer", "")
+            if text_answer and "text_answer" not in errors:
+                clean = text_answer.replace("\n", " ").replace("#", "").strip()
+                preview = clean[:85] + ("…" if len(clean) > 85 else "")
+                _pcard("Text Answer", "active", [f'<em>{preview}</em>'])
+            elif "text_answer" in errors:
+                _pcard("Text Answer", "error",
+                       [f'<code>{str(errors["text_answer"])[:100]}</code>'])
+            else:
+                _pcard("Text Answer", "inactive", ["No answer produced."])
+
+            # Step 1b — Intent Classifier (parallel with Text Answer above)
             if intent_d:
                 _pcard(
                     "Intent Classifier", "active",
@@ -1077,14 +1120,49 @@ def render_pipeline(result: dict) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SESSION LOG (for professor / grader review)
+# SESSION LOG  —  ADMIN-ONLY (hidden from regular users)
+#
+# Every completed pipeline appends a structured entry to a persistent JSONL
+# file next to app.py. The file survives across browser sessions (until the
+# Streamlit Cloud container redeploys), so app owners can later inspect what
+# the professor / any user queried and how each agent performed.
+#
+# The log expander is GATED behind a URL param: ?admin=<key>. The key must
+# match st.secrets["ADMIN_KEY"]. Owners bookmark the admin URL; everyone
+# else (including the professor) sees a clean page with no log surface.
 # ══════════════════════════════════════════════════════════════════════════════
+
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "videosense_log.jsonl")
+
+
+def _is_admin() -> bool:
+    """Owner-only check via ?admin=<key> URL param matching st.secrets['ADMIN_KEY'].
+
+    If ADMIN_KEY isn't set in secrets (e.g. local dev without a secrets.toml),
+    any non-empty ?admin=... value unlocks the log — convenient for development,
+    while still keeping it hidden by default.
+    """
+    param = st.query_params.get("admin", "")
+    if not param:
+        return False
+    try:
+        expected = st.secrets.get("ADMIN_KEY")
+        if expected:
+            return param == expected
+    except Exception:
+        pass
+    # Local-dev fallback when no secret is configured
+    return bool(param)
+
 
 def _append_session_log(query: str, trace: dict) -> None:
     """Build a structured log entry from a completed pipeline trace and append
-    to st.session_state['session_log']. Runs AFTER run_pipeline returns — zero
+    to the persistent JSONL file. Runs AFTER run_pipeline returns — zero
     impact on pipeline latency. Captures: query, total time, intent decision,
-    per-video metadata + verdict + timestamp, and any errors.
+    per-video metadata + verdict + timestamp + corrections, and any errors.
+
+    File writes are best-effort: if they fail (read-only FS, disk full, etc.)
+    we swallow the exception silently so the user-facing app keeps working.
     """
     intent_obj = trace.get("intent")
     videos = trace.get("videos", [])
@@ -1128,7 +1206,32 @@ def _append_session_log(query: str, trace: dict) -> None:
         ],
         "global_errors": list(trace.get("errors", {}).keys()),
     }
-    st.session_state.setdefault("session_log", []).append(entry)
+
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+    except Exception:
+        pass  # best-effort — never break the app if the log write fails
+
+
+def _load_persistent_log() -> list[dict]:
+    """Read the full persistent log from disk. Used only by the admin view."""
+    if not os.path.exists(LOG_FILE):
+        return []
+    entries: list[dict] = []
+    try:
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue  # skip malformed lines
+    except Exception:
+        pass
+    return entries
 
 
 def _render_log_entry(entry: dict) -> None:
@@ -1175,29 +1278,43 @@ def _render_log_entry(entry: dict) -> None:
 
 
 def render_session_log() -> None:
-    """Bottom-of-page expander that shows every query run this session and how
-    each agent performed. Designed for the professor / grader to inspect the
-    multi-agent system end-to-end. Downloadable as JSON for permanent record."""
-    log = st.session_state.get("session_log", [])
+    """ADMIN-ONLY bottom-of-page expander. Renders nothing unless the URL
+    has ?admin=<key> matching st.secrets['ADMIN_KEY']. For owners (us) to
+    inspect what the professor and other users queried — invisible to them.
+
+    Reads from the persistent JSONL file (not session_state), so admins see
+    every query from every session, not just the current browser's history.
+    """
+    if not _is_admin():
+        return
+
+    log = _load_persistent_log()
     if not log:
+        st.markdown(
+            '<p style="font-size:0.85rem;color:var(--g-text-3);'
+            'text-align:center;margin-top:1rem;">'
+            '🔒 Admin view active — no queries logged yet on this container.'
+            '</p>',
+            unsafe_allow_html=True,
+        )
         return
 
     label = (
-        f"📋 Session log — {len(log)} "
-        f"{'query' if len(log) == 1 else 'queries'} so far"
+        f"🔒 Admin — Session log ({len(log)} "
+        f"{'query' if len(log) == 1 else 'queries'} across all sessions)"
     )
     with st.expander(label, expanded=False):
         st.caption(
-            "Per-query trace of what each agent (Intent Classifier · YouTube "
-            "Search · Timestamp Picker · Verification) decided. Most recent "
-            "first. Persists for this browser session only — download as JSON "
-            "for a permanent record."
+            "Owner-only view. Every query run on this app (from any browser "
+            "session) is captured here with the full per-agent trace. "
+            "Persists for the lifetime of the Streamlit Cloud container "
+            "(resets on redeploy). Newest first."
         )
 
         log_json = json.dumps(log, indent=2, default=str)
         ts_slug = datetime.now().strftime("%Y%m%d_%H%M%S")
         st.download_button(
-            label="⬇ Download log (JSON)",
+            label="⬇ Download full log (JSON)",
             data=log_json,
             file_name=f"videosense_log_{ts_slug}.json",
             mime="application/json",
@@ -1208,6 +1325,75 @@ def render_session_log() -> None:
         for entry in reversed(log):  # newest first
             _render_log_entry(entry)
             st.markdown("---")
+
+
+_MERMAID_PIPELINE_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  body { margin: 0; padding: 12px 8px; background: transparent; font-family: 'DM Sans', sans-serif; }
+  .mermaid { font-family: 'DM Sans', sans-serif; display: flex; justify-content: center; }
+  .mermaid svg { max-width: 100%; height: auto; }
+</style>
+</head>
+<body>
+<pre class="mermaid">
+flowchart TD
+    Q([User query]) --> S1((Step 1<br/>parallel))
+    S1 --> TA[Text Answer]
+    S1 --> IC[Intent Classifier]
+
+    IC --> D{has_visual_intent?}
+    D -->|no| TXT([Text answer only])
+    D -->|yes| QO{query > 10 words?}
+    QO -->|no| YS[YouTube Search<br/>top 3 candidates]
+    QO -->|yes| OPT[Optimizer rewrite<br/>temp 0.2 + guard]
+    OPT --> YS
+
+    YS --> S2((Per-video × 3<br/>parallel))
+    S2 --> TS[Timestamp Picker<br/>caps at 10 min]
+    S2 --> VR[Verification Agent<br/>verdict + ts correction]
+
+    TS --> RD{Render decision<br/>format + verdict?}
+    VR --> RD
+
+    RD -->|short<br/>any verdict| CAR1([3-video carousel<br/>video first])
+    RD -->|long + strong_match| ONE([Single video<br/>text first<br/>no carousel])
+    RD -->|long + partial/poor| CAR2([3-video carousel<br/>'alternates' framing<br/>text first])
+
+    classDef entry    fill:#f0f4f9,stroke:#5f6368,color:#1f1f1f,stroke-width:1.5px
+    classDef agent    fill:#e8f0fe,stroke:#1a73e8,color:#1f1f1f,stroke-width:1.5px
+    classDef parallel fill:#fef7e0,stroke:#b06000,color:#1f1f1f,stroke-width:2px
+    classDef decision fill:#f3e8fd,stroke:#8430ce,color:#1f1f1f
+    classDef terminal fill:#e6f4ea,stroke:#137333,color:#1f1f1f,stroke-width:1.5px
+
+    class Q entry
+    class TA,IC,OPT,YS,TS,VR agent
+    class S1,S2 parallel
+    class D,QO,RD decision
+    class TXT,CAR1,ONE,CAR2 terminal
+</pre>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      fontFamily: 'DM Sans, sans-serif',
+      fontSize: '14px',
+      primaryColor: '#e8f0fe',
+      primaryTextColor: '#1f1f1f',
+      primaryBorderColor: '#1a73e8',
+      lineColor: '#5f6368'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true, padding: 16 }
+  });
+</script>
+</body>
+</html>
+"""
 
 
 def render_how_it_works() -> None:
@@ -1235,45 +1421,45 @@ def render_how_it_works() -> None:
                 "then flip through the carousel locally without triggering new calls."
             )
 
-        st.markdown("### Decision tree")
-        st.code(
-            "Query submitted\n"
-            "├─ [parallel] Text Answer  +  Intent Classifier\n"
-            "│\n"
-            "├─ has_visual_intent = False  →  text answer only on both columns\n"
-            "└─ has_visual_intent = True\n"
-            "    └─ YouTube Search  (raw query for ≤10 words; LLM rewrite for >10)\n"
-            "        ├─ No results  →  warning banner; no embed\n"
-            "        └─ Top 3 videos found  →  parallel per-video pipeline:\n"
-            "            ├─ duration ≤ 20s  →  embed from 0:00 (skip Timestamp Picker)\n"
-            "            └─ duration > 20s  →  Timestamp Picker\n"
-            "                                  ├─ Valid range  →  embed at start→end\n"
-            "                                  └─ Invalid      →  embed from 0:00\n"
-            "            └─ [always] Verification Agent\n"
-            "                ├─ Video relevance  →  strong / partial / poor match badge\n"
-            "                └─ Timestamp accuracy  →  can override Picker's start_seconds\n"
-            "    └─ Carousel: arrow buttons flip between the 3 fully-analysed videos\n"
-            "                 (instant — no new API calls; idx tracked in session_state)",
-            language="text",
+        st.markdown("### Pipeline flowchart")
+        st.components.v1.html(_MERMAID_PIPELINE_HTML, height=780, scrolling=True)
+
+        st.markdown("### Rendering rules (UI layer)")
+        st.markdown(
+            "Once all 5 agents have run, the UI applies two further decisions "
+            "based on the intent's `format` and the top video's verification verdict:\n\n"
+            "- **Placement** — `format=short` (quick visual tasks like *tie a "
+            "Windsor knot*) puts the video FIRST and the text below, so the user "
+            "doesn't scroll past walls of text. `format=long` keeps text-first "
+            "so context frames the video.\n"
+            "- **Exposure** — `short` always exposes all 3 videos via the carousel "
+            "(browsing short clips is natural). `long + strong_match` shows just "
+            "video #1 with no carousel UI (AI is confident; alternatives would "
+            "be noise). `long + partial/poor` re-exposes all 3 with *'top match "
+            "wasn't a strong fit — browse alternates'* framing.\n"
+            "- **Comparison** — the default tab is the solo VideoSense view "
+            "(mimics a real consumer-Gemini surface). A second tab, "
+            "*Compare to Gemini today*, opens the side-by-side for anyone "
+            "curious about the before/after."
         )
 
         st.markdown("### Verification Agent")
         st.markdown(
-            "After a video is found, a separate Gemini call **watches the actual "
+            "After videos are found, a separate Gemini call **watches the actual "
             "video** (via `Part.from_uri` / `file_data` ingestion — the same "
             "capability the Timestamp Picker uses, not just title/metadata) and "
             "judges two things independently:\n\n"
-            "1. **Video relevance** — does this video genuinely answer the query? "
-            "Returns a verdict (`strong_match` / `partial_match` / `poor_match`) "
-            "and confidence score, surfaced as a coloured strip above the embed.\n"
-            "2. **Timestamp accuracy** — does the Picker's proposed clip actually "
-            "point to the right moment? If not, the agent returns "
-            "`corrected_start_seconds` and the pipeline overrides the Picker's "
-            "choice with the verification agent's correction (visible in the UI "
-            "as a 🔧 'Corrected start' notice).\n\n"
+            "1. **Video relevance** — returns `strong_match` / `partial_match` / "
+            "`poor_match` + confidence, surfaced as a coloured strip above the "
+            "embed.\n"
+            "2. **Timestamp accuracy** — can return `corrected_start_seconds` and "
+            "the pipeline overrides the Picker's choice (visible as a 🔧 "
+            "'Corrected start' notice).\n\n"
             "A `poor_match` verdict does **not** suppress the video — by design, "
             "it surfaces as a transparent trust signal so the user can judge "
-            "for themselves rather than having results silently hidden."
+            "for themselves rather than having results silently hidden. The "
+            "verdict *does* feed the exposure rule above: a `strong_match` on "
+            "a long-form query collapses the carousel to one video."
         )
 
         st.markdown("### Search-query optimization")
@@ -1294,7 +1480,7 @@ def render_how_it_works() -> None:
             "| Failure | Fallback |\n"
             "|---|---|\n"
             "| Gemini overloaded (503) | Retries ×3 with exponential backoff (2s, 4s between attempts) |\n"
-            "| Intent classifier fails | Treatment column shows text answer + error banner |\n"
+            "| Intent classifier fails | Treatment view shows text answer + error banner |\n"
             "| YouTube API error | Error banner with diagnosis; text answer still shown |\n"
             "| No video results | Warning banner; no embed |\n"
             "| Timestamp out of range | Plays from 0:00; warning shown in pipeline |\n"
@@ -1511,11 +1697,23 @@ def main() -> None:
         result = st.session_state.last_result
         st.divider()
         render_error_banners(result)
-        left, right = st.columns(2, gap="large")
-        with left:
-            render_control(result["query"], result["text_answer"])
-        with right:
-            render_treatment(result)
+
+        # Main view = the new product (VideoSense). The comparison is one
+        # tap away but not in the user's face. Mimics shipping a real feature
+        # rather than presenting a comparison harness.
+        tab_main, tab_compare = st.tabs([
+            "VideoSense",
+            "Compare to Gemini today",
+        ])
+        with tab_main:
+            render_treatment(result, solo=True)
+        with tab_compare:
+            left, right = st.columns(2, gap="large")
+            with left:
+                render_control(result["query"], result["text_answer"])
+            with right:
+                render_treatment(result)
+
         st.divider()
         render_pipeline(result)
 
