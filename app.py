@@ -1327,164 +1327,171 @@ def render_session_log() -> None:
             st.markdown("---")
 
 
-_MERMAID_PIPELINE_HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>
-  body { margin: 0; padding: 12px 8px; background: transparent; font-family: 'DM Sans', sans-serif; }
-  .mermaid { font-family: 'DM Sans', sans-serif; display: flex; justify-content: center; }
-  .mermaid svg { max-width: 100%; height: auto; }
-</style>
-</head>
-<body>
-<pre class="mermaid">
-flowchart TD
-    Q([User query]) --> S1((Step 1<br/>parallel))
-    S1 --> TA[Text Answer]
-    S1 --> IC[Intent Classifier]
+_PIPELINE_DOT = """
+digraph VideoSensePipeline {
+    rankdir=TB;
+    bgcolor=transparent;
+    node [shape=box, style="rounded,filled", fillcolor="#e8f0fe",
+          color="#1a73e8", fontname="DM Sans", fontsize=11,
+          margin="0.18,0.10"];
+    edge [color="#5f6368", fontname="DM Sans", fontsize=10];
 
-    IC --> D{has_visual_intent?}
-    D -->|no| TXT([Text answer only])
-    D -->|yes| QO{query > 10 words?}
-    QO -->|no| YS[YouTube Search<br/>top 3 candidates]
-    QO -->|yes| OPT[Optimizer rewrite<br/>temp 0.2 + guard]
-    OPT --> YS
+    // Entry — what the user types
+    Q [label="What the user types", shape=oval, fillcolor="#f0f4f9", color="#5f6368"];
 
-    YS --> S2((Per-video × 3<br/>parallel))
-    S2 --> TS[Timestamp Picker<br/>caps at 10 min]
-    S2 --> VR[Verification Agent<br/>verdict + ts correction]
+    // Parallel-step groupings (yellow circles — multiple agents working at once)
+    S1 [label="Step 1\\n(in parallel)", shape=circle, fillcolor="#fef7e0",
+        color="#b06000", penwidth=2, width=1.1, fixedsize=true];
+    S2 [label="Per video x3\\n(in parallel)", shape=circle, fillcolor="#fef7e0",
+        color="#b06000", penwidth=2, width=1.1, fixedsize=true];
 
-    TS --> RD{Render decision<br/>format + verdict?}
-    VR --> RD
+    // AI agents (blue rounded boxes)
+    TA  [label="Write the text\\nanswer"];
+    IC  [label="Decide if a video\\nwould help"];
+    YS  [label="Find the top 3\\nYouTube videos"];
+    OPT [label="AI cleans up\\nthe search phrase"];
+    TS  [label="Pick the right\\nmoment in video"];
+    VR  [label="Quality check\\n(watches the video)"];
 
-    RD -->|short<br/>any verdict| CAR1([3-video carousel<br/>video first])
-    RD -->|long + strong_match| ONE([Single video<br/>text first<br/>no carousel])
-    RD -->|long + partial/poor| CAR2([3-video carousel<br/>'alternates' framing<br/>text first])
+    // Decisions (purple diamonds — branching points)
+    D  [label="Does this need\\na video?", shape=diamond, fillcolor="#f3e8fd", color="#8430ce"];
+    QO [label="Is the question\\nlong?", shape=diamond, fillcolor="#f3e8fd", color="#8430ce"];
+    RD [label="How to show\\nthe answer", shape=diamond, fillcolor="#f3e8fd", color="#8430ce"];
 
-    classDef entry    fill:#f0f4f9,stroke:#5f6368,color:#1f1f1f,stroke-width:1.5px
-    classDef agent    fill:#e8f0fe,stroke:#1a73e8,color:#1f1f1f,stroke-width:1.5px
-    classDef parallel fill:#fef7e0,stroke:#b06000,color:#1f1f1f,stroke-width:2px
-    classDef decision fill:#f3e8fd,stroke:#8430ce,color:#1f1f1f
-    classDef terminal fill:#e6f4ea,stroke:#137333,color:#1f1f1f,stroke-width:1.5px
+    // Terminal outcomes (green ovals — what the user finally sees)
+    TXT  [label="Just text\\n(no video)", shape=oval, fillcolor="#e6f4ea", color="#137333"];
+    CAR1 [label="Show 3 videos\\n(video at top)", shape=oval, fillcolor="#e6f4ea", color="#137333"];
+    ONE  [label="Show 1 video\\n(text above)", shape=oval, fillcolor="#e6f4ea", color="#137333"];
+    CAR2 [label="Show 3 videos\\n(top wasn't perfect)", shape=oval, fillcolor="#e6f4ea", color="#137333"];
 
-    class Q entry
-    class TA,IC,OPT,YS,TS,VR agent
-    class S1,S2 parallel
-    class D,QO,RD decision
-    class TXT,CAR1,ONE,CAR2 terminal
-</pre>
-<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
-<script>
-  mermaid.initialize({
-    startOnLoad: true,
-    theme: 'base',
-    themeVariables: {
-      fontFamily: 'DM Sans, sans-serif',
-      fontSize: '14px',
-      primaryColor: '#e8f0fe',
-      primaryTextColor: '#1f1f1f',
-      primaryBorderColor: '#1a73e8',
-      lineColor: '#5f6368'
-    },
-    flowchart: { curve: 'basis', htmlLabels: true, padding: 16 }
-  });
-</script>
-</body>
-</html>
+    // Edges
+    Q   -> S1;
+    S1  -> TA;
+    S1  -> IC;
+    IC  -> D;
+    D   -> TXT [label="no"];
+    D   -> QO  [label="yes"];
+    QO  -> YS  [label="no"];
+    QO  -> OPT [label="yes"];
+    OPT -> YS;
+    YS  -> S2;
+    S2  -> TS;
+    S2  -> VR;
+    TS  -> RD;
+    VR  -> RD;
+    RD  -> CAR1 [label="quick task"];
+    RD  -> ONE  [label="long + AI sure"];
+    RD  -> CAR2 [label="long + AI unsure"];
+}
 """
 
 
 def render_how_it_works() -> None:
     with st.expander("How this prototype works", expanded=False):
-        st.markdown("### Five-agent pipeline")
+        st.markdown("### Five AI agents working together")
 
         col1, col2 = st.columns(2)
         with col1:
-            st.markdown("**Models & APIs**")
+            st.markdown("**What's powering this**")
             st.markdown(
-                "- **Gemini** (`gemini-3.1-flash-lite`) — powers the Text Answer, "
-                "Intent Classifier, Timestamp Picker, Verification Agent, and the "
-                "conditional LLM rewrite inside YouTube Search.\n"
-                "- **YouTube Data API v3** — `search.list` + `videos.list` for "
-                "candidate retrieval and video metadata."
+                "- **Google's Gemini AI** does the thinking — writing the text "
+                "answer, deciding if a video would help, watching the videos, "
+                "and judging whether they actually answer the question.\n"
+                "- **YouTube's official search API** is what we use to find "
+                "the candidate videos in the first place."
             )
         with col2:
-            st.markdown("**Parallelism**")
+            st.markdown("**Why this feels fast**")
             st.markdown(
-                "Text Answer + Intent Classifier run in parallel. YouTube Search "
-                "returns the **top 3 candidates** ranked by view-count × short-form "
-                "boost, then Timestamp Picker + Verification run for **all 3 videos "
-                "in parallel** via `ThreadPoolExecutor`. This is ~3× the API cost "
-                "but the same wall-clock latency as processing one — the user can "
-                "then flip through the carousel locally without triggering new calls."
+                "Most AI demos run each step one after another, so the user "
+                "waits for everything in sequence. We instead fire up multiple "
+                "AI agents at the same time wherever we can. When we pull 3 "
+                "candidate videos, all 3 get analyzed simultaneously — costs "
+                "about 3× more in API charges, but the user waits roughly the "
+                "same time as if we'd analyzed one. They can then flip between "
+                "all 3 instantly with no extra wait."
             )
 
-        st.markdown("### Pipeline flowchart")
-        st.components.v1.html(_MERMAID_PIPELINE_HTML, height=780, scrolling=True)
-
-        st.markdown("### Rendering rules (UI layer)")
+        st.markdown("### How a query flows through the system")
         st.markdown(
-            "Once all 5 agents have run, the UI applies two further decisions "
-            "based on the intent's `format` and the top video's verification verdict:\n\n"
-            "- **Placement** — `format=short` (quick visual tasks like *tie a "
-            "Windsor knot*) puts the video FIRST and the text below, so the user "
-            "doesn't scroll past walls of text. `format=long` keeps text-first "
-            "so context frames the video.\n"
-            "- **Exposure** — `short` always exposes all 3 videos via the carousel "
-            "(browsing short clips is natural). `long + strong_match` shows just "
-            "video #1 with no carousel UI (AI is confident; alternatives would "
-            "be noise). `long + partial/poor` re-exposes all 3 with *'top match "
-            "wasn't a strong fit — browse alternates'* framing.\n"
-            "- **Comparison** — the default tab is the solo VideoSense view "
-            "(mimics a real consumer-Gemini surface). A second tab, "
-            "*Compare to Gemini today*, opens the side-by-side for anyone "
-            "curious about the before/after."
+            "Read the diagram top to bottom. Yellow circles are *steps that "
+            "run multiple agents at the same time*. Blue rounded boxes are "
+            "individual AI agents. Purple diamonds are decisions the system "
+            "makes. Green ovals are what the user finally sees on screen."
+        )
+        st.graphviz_chart(_PIPELINE_DOT, use_container_width=True)
+
+        st.markdown("### How we decide what to actually show")
+        st.markdown(
+            "After all the AI work is done, the system makes two product "
+            "decisions about how to present the answer:\n\n"
+            "- **Where the video goes on the page.** For quick visual tasks "
+            "(like *tie a Windsor knot*), the video goes at the TOP and the "
+            "text below — don't make someone read three paragraphs when a "
+            "video is the whole answer. For complex topics (like *how does GPS "
+            "work*), text goes first so the user has context before watching.\n"
+            "- **How many videos we show.** For quick visual tasks, we always "
+            "show all 3 options (browsing short clips feels natural — think "
+            "TikTok). For complex topics, if the AI is highly confident in the "
+            "top video, we show just 1 — extra options would be clutter. If "
+            "the AI is unsure about the top match, we show all 3 with a note "
+            "like *'top match wasn't perfect — try the alternatives.'*\n"
+            "- **Comparing to Gemini today.** The default view looks like a "
+            "real Gemini answer. A second tab, *Compare to Gemini today*, "
+            "opens a side-by-side showing what current Gemini does (no video) "
+            "vs what our prototype does. Useful for seeing the before/after "
+            "without forcing it on every user."
         )
 
-        st.markdown("### Verification Agent")
+        st.markdown("### The Verification Agent — our quality check")
         st.markdown(
-            "After videos are found, a separate Gemini call **watches the actual "
-            "video** (via `Part.from_uri` / `file_data` ingestion — the same "
-            "capability the Timestamp Picker uses, not just title/metadata) and "
-            "judges two things independently:\n\n"
-            "1. **Video relevance** — returns `strong_match` / `partial_match` / "
-            "`poor_match` + confidence, surfaced as a coloured strip above the "
-            "embed.\n"
-            "2. **Timestamp accuracy** — can return `corrected_start_seconds` and "
-            "the pipeline overrides the Picker's choice (visible as a 🔧 "
-            "'Corrected start' notice).\n\n"
-            "A `poor_match` verdict does **not** suppress the video — by design, "
-            "it surfaces as a transparent trust signal so the user can judge "
-            "for themselves rather than having results silently hidden. The "
-            "verdict *does* feed the exposure rule above: a `strong_match` on "
-            "a long-form query collapses the carousel to one video."
+            "This is the agent that makes the system trustworthy. After we "
+            "pick a video, a separate Gemini call **actually watches the video** "
+            "(Gemini can ingest video, not just read titles) and independently "
+            "judges two things:\n\n"
+            "1. **Does this video actually answer the question?** Returns a "
+            "verdict (*strong match*, *partial match*, or *poor match*) and a "
+            "confidence score, shown as a coloured badge above the video.\n"
+            "2. **Is the moment we picked the right one?** If the agent thinks "
+            "there's a better starting point in the video, it suggests one and "
+            "the system automatically uses it (you'll see a 🔧 *Corrected start* "
+            "notice when this happens).\n\n"
+            "Important design choice: a *poor match* verdict doesn't hide the "
+            "video — we surface it as a transparent trust signal so the user "
+            "can judge for themselves rather than having results silently "
+            "filtered out. The verdict *does* feed the rule above: when the "
+            "AI is confident in a top match for a complex query, we collapse "
+            "the carousel to just that one video."
         )
 
-        st.markdown("### Search-query optimization")
+        st.markdown("### How we ask YouTube for videos")
         st.markdown(
-            "For typical queries (**≤10 words**), the raw user query is sent to "
-            "YouTube verbatim with a `shorts` / `tutorial` suffix appended — no "
-            "LLM call, no risk of over-compression. Only **long, conversational "
-            "queries (>10 words)** go through an LLM rewrite step, and even then "
-            "with temperature `0.2` for obedience and a validation guard that "
-            "falls back to the raw query if the rewrite degenerates to fewer "
-            "than 3 words. This was hardened after an earlier failure where the "
-            "optimizer compressed *'How do I tie a Windsor knot'* to *'Wind'*, "
-            "which YouTube happily matched against the Naruto ending song."
+            "Most user questions are already short and clean (≤10 words). "
+            "For those, we send the question straight to YouTube — no AI "
+            "rewrite, no risk of the AI mangling it. Only long, rambling "
+            "questions (>10 words) get summarized into a search phrase by AI "
+            "first, and even then we sanity-check the rewrite and fall back "
+            "to the original if the AI returns something suspicious.\n\n"
+            "**Why this matters:** an earlier version had AI rewrite *every* "
+            "query. It once shortened *'How do I tie a Windsor knot'* into "
+            "just *'Wind'* — and YouTube cheerfully returned the *Naruto* "
+            "ending song titled *'Wind'*. The verification agent then correctly "
+            "flagged it as a poor match, but the lesson was: don't ask an AI "
+            "to over-summarize when the original question is already clear."
         )
 
-        st.markdown("### Error and fallback states")
+        st.markdown("### What happens when something breaks")
         st.markdown(
-            "| Failure | Fallback |\n"
+            "Real APIs fail sometimes. We handle the common ones so the app "
+            "never crashes or shows an empty screen:\n\n"
+            "| What fails | What happens instead |\n"
             "|---|---|\n"
-            "| Gemini overloaded (503) | Retries ×3 with exponential backoff (2s, 4s between attempts) |\n"
-            "| Intent classifier fails | Treatment view shows text answer + error banner |\n"
-            "| YouTube API error | Error banner with diagnosis; text answer still shown |\n"
-            "| No video results | Warning banner; no embed |\n"
-            "| Timestamp out of range | Plays from 0:00; warning shown in pipeline |\n"
-            "| Verification fails | Warning strip in UI; does not block video display |"
+            "| Gemini is too busy to respond | Automatically retry up to 3 times, waiting longer between each try |\n"
+            "| The AI can't decide if a video is needed | Show the text answer + an error banner |\n"
+            "| YouTube's API errors out | Show an error banner with the cause; the text answer still works |\n"
+            "| No relevant videos exist | Show a warning; no broken video embed |\n"
+            "| The AI picks an unreasonable timestamp | Play the video from the start instead |\n"
+            "| The quality check itself fails | Show a warning strip; don't block the video |"
         )
 
 
