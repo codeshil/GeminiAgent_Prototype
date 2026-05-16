@@ -160,22 +160,45 @@ def classify_visual_intent(query: str) -> VisualIntent:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _optimize_query(query: str, fmt: str) -> str:
-    """Rewrite user query into an optimized YouTube search string."""
-    suffix = "shorts tutorial" if fmt == "short" else "tutorial"
+    """Build the YouTube search string.
+
+    Strategy:
+      - Pass-through for normal-length queries (≤10 words) — just append a
+        format hint. No LLM call, no risk of over-compression.
+      - Only call the LLM to summarize genuinely long, conversational queries
+        (>10 words), and even then with low temperature and a validation
+        guard so the model can't degenerate the query into garbage
+        (e.g. "Windsor knot" → "Wind" — the failure we hit on 2026-05-14).
+    """
+    suffix = "shorts" if fmt == "short" else "tutorial"
+    clean = query.rstrip("?.!,;: ").strip()
+
+    # Pass-through for normal-length queries — no LLM, no risk.
+    if len(clean.split()) <= 10:
+        return f"{clean} {suffix}"
+
+    # Long query — distill via LLM with guardrails.
     try:
         client = _get_client()
         resp = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=(
-                f'Rewrite into a YouTube search string (3–6 words, no quotes) '
-                f'for a {fmt}-form video. Append "{suffix.split()[0]}" if natural. '
-                f'Query: "{query}". Return ONLY the search string.'
+                f'Summarize this question into a 4–7 word YouTube search query. '
+                f'Keep all important nouns. Append "{suffix}". '
+                f'Question: "{clean}". Return ONLY the search string, no quotes.'
             ),
-            config=types.GenerateContentConfig(max_output_tokens=25),
+            config=types.GenerateContentConfig(
+                max_output_tokens=30,
+                temperature=0.2,  # low randomness — we want obedience, not creativity
+            ),
         )
-        return resp.text.strip().strip('"') or query
+        rewritten = resp.text.strip().strip('"')
+        # Validation guard: if the rewrite degenerates, fall back to the raw query.
+        if len(rewritten.split()) >= 3:
+            return rewritten
     except Exception:
-        return query
+        pass
+    return f"{clean} {suffix}"
 
 
 @_retry()
