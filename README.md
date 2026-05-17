@@ -210,4 +210,4 @@ needed.
 ## Authors
 
 - **Aashil Soni** — UCLA Anderson MBA, MGMT 275 (AI Product Shipping), Spring 2026
-- **Forum Sanjanwala** — UCLA Anderson MBA, MGMT 275 (AI Product Shipping), Spring 2026
+- **Forum Sanjanwala** — UCLA Anderson MSBA, MGMT 275 (AI Product Shipping), Spring 2026
